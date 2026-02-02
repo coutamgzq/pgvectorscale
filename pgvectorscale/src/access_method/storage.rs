@@ -139,6 +139,15 @@ pub trait Storage {
     ) -> Option<LabelSet>;
 
     fn get_has_labels(&self) -> bool;
+
+    fn quantize_vector(&self, vector: &[f32]) -> Option<Vec<u64>>;
+
+    fn get_quantized_vector<S: StatsNodeRead>(
+        &self,
+        index_pointer: IndexPointer,
+        meta_page: &MetaPage,
+        stats: &mut S,
+    ) -> Option<Vec<u64>>;
 }
 
 #[derive(PartialEq, Debug)]

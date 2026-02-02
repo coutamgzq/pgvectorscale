@@ -313,8 +313,14 @@ pub extern "C-unwind" fn ambuild(
     );
 
     // Train quantizer before doing anything in parallel
+    let start_time = std::time::Instant::now();
     let write_stats =
         maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
+    let duration = start_time.elapsed();
+    log!(
+        "maybe_train_quantizer completed in {}ms",
+        duration.as_millis()
+    );
     unsafe {
         meta_page.store(&index_relation, false);
     };
@@ -344,6 +350,7 @@ pub extern "C-unwind" fn ambuild(
         pcxt: *mut pg_sys::ParallelContext,
         snapshot: *mut pg_sys::SnapshotData,
     }
+    log!("build with {} workers", workers);
     let parallel_data = if workers > 0 {
         notice!("Parallel build with {} workers", workers);
         unsafe {

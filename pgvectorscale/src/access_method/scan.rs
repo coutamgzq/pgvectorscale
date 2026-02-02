@@ -4,6 +4,7 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 
 use crate::{
     access_method::{
+        distance::distance_xor_optimized,
         graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
         sbq::storage::SbqSpeedupStorage,
     },
@@ -20,11 +21,19 @@ use super::{
     },
     sbq::{
         quantize::SbqQuantizer, storage::SbqSpeedupStorageLsnPrivateData, SbqMeans,
-        SbqSearchDistanceMeasure,
+        SbqSearchDistanceMeasure, SbqVectorElement,
     },
     stats::QuantizerStats,
     storage::{Storage, StorageType},
+    guc::TSV_USE_QUANTIZED_SORT,
 };
+
+#[derive(Clone)]
+struct QuantizedVectorEntry {
+    heap_pointer: HeapPointer,
+    index_pointer: IndexPointer,
+    quantized_vector: Vec<SbqVectorElement>,
+}
 
 /* Be very careful not to transfer PgRelations in the state, as they can change between calls. That means we shouldn't be
 using lifetimes here. Everything should be owned */
@@ -42,6 +51,10 @@ struct TSVScanState {
     distance_fn: Option<DistanceFn>,
     meta_page: MetaPage,
     last_buffer: Option<PinnedBufferShare>,
+    quantized_entries: Vec<QuantizedVectorEntry>,
+    quantized_sorted: bool,
+    quantized_index: usize,
+    query_vector: Option<Vec<f32>>,
 }
 
 impl TSVScanState {
@@ -51,6 +64,10 @@ impl TSVScanState {
             distance_fn: None,
             meta_page,
             last_buffer: None,
+            quantized_entries: Vec::new(),
+            quantized_sorted: false,
+            quantized_index: 0,
+            query_vector: None,
         }
     }
 
@@ -64,6 +81,8 @@ impl TSVScanState {
         let meta_page = MetaPage::fetch(index);
         let storage = meta_page.get_storage_type();
         let distance = meta_page.get_distance_function();
+
+        self.query_vector = Some(query.vec().to_full_slice().to_vec());
 
         let store_type = match storage {
             StorageType::Plain => {
@@ -380,14 +399,29 @@ pub extern "C-unwind" fn amgettuple(
     let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
     match &mut storage {
         StorageState::SbqSpeedup(quantizer, iter) => {
-            let bq = SbqSpeedupStorage::load_for_search(
-                &indexrel,
-                &heaprel,
-                quantizer,
-                &state.meta_page,
-            );
-            let next = iter.next_with_resort(&scan, &indexrel, &bq);
-            get_tuple(state, next, scan)
+            if TSV_USE_QUANTIZED_SORT.get() {
+                if !state.quantized_sorted {
+                    let bq = SbqSpeedupStorage::load_for_search(
+                        &indexrel,
+                        &heaprel,
+                        quantizer,
+                        &state.meta_page,
+                    );
+                    build_quantized_entries(state, &bq, quantizer);
+                    sort_quantized_entries(state, quantizer);
+                    state.quantized_sorted = true;
+                }
+                get_next_quantized_entry(state, scan)
+            } else {
+                let bq = SbqSpeedupStorage::load_for_search(
+                    &indexrel,
+                    &heaprel,
+                    quantizer,
+                    &state.meta_page,
+                );
+                let next = iter.next_with_resort(&scan, &indexrel, &bq);
+                get_tuple(state, next, scan)
+            }
         }
         StorageState::Plain(iter) => {
             let storage = PlainStorage::load_for_search(&indexrel, &heaprel, &state.meta_page);
@@ -402,6 +436,87 @@ pub extern "C-unwind" fn amgettuple(
             get_tuple(state, next, scan)
         }
     }
+}
+
+fn build_quantized_entries<S: Storage>(
+    state: &mut TSVScanState,
+    storage: &S,
+    quantizer: &SbqQuantizer,
+) {
+    state.quantized_entries.clear();
+    state.quantized_index = 0;
+    
+    let query_slice = state.query_vector.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let query_quantized = quantizer.quantize(query_slice);
+    
+    let mut graph = Graph::new(GraphNeighborStore::Disk, &mut state.meta_page);
+    
+    loop {
+        let storage_mut = unsafe { &mut *(state.storage as *mut StorageState) };
+        
+        if let StorageState::SbqSpeedup(_, iter) = storage_mut {
+            graph.greedy_search_iterate(
+                &mut iter.lsr,
+                state.meta_page.get_search_list_size_for_build() as usize,
+                true,
+                None,
+                storage,
+            );
+            
+            if let Some((heap_pointer, index_pointer)) = iter.next(storage) {
+                if let Some(quantized_vector) = storage.get_quantized_vector(
+                    index_pointer,
+                    &state.meta_page,
+                    &mut iter.lsr.stats,
+                ) {
+                    state.quantized_entries.push(QuantizedVectorEntry {
+                        heap_pointer,
+                        index_pointer,
+                        quantized_vector,
+                    });
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
+fn sort_quantized_entries(state: &mut TSVScanState, quantizer: &SbqQuantizer) {
+    let query_slice = state.query_vector.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let query_quantized = quantizer.quantize(query_slice);
+    
+    state.quantized_entries.sort_by(|a, b| {
+        let dist_a = distance_xor_optimized(&query_quantized, &a.quantized_vector) as f32;
+        let dist_b = distance_xor_optimized(&query_quantized, &b.quantized_vector) as f32;
+        dist_a.total_cmp(&dist_b)
+    });
+}
+
+fn get_next_quantized_entry(
+    state: &mut TSVScanState,
+    mut scan: PgBox<pg_sys::IndexScanDescData>,
+) -> bool {
+    if state.quantized_index >= state.quantized_entries.len() {
+        return false;
+    }
+    
+    let entry = &state.quantized_entries[state.quantized_index];
+    state.quantized_index += 1;
+    
+    scan.xs_recheckorderby = false;
+    let tid_to_set = &mut scan.xs_heaptid;
+    entry.heap_pointer.to_item_pointer_data(tid_to_set);
+    
+    let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
+    state.last_buffer = Some(PinnedBufferShare::read(
+        &indexrel,
+        entry.index_pointer.block_number,
+    ));
+    
+    true
 }
 
 fn get_tuple(

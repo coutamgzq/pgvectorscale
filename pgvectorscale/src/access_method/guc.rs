@@ -6,6 +6,7 @@ pub static TSV_PARALLEL_FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new
 pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
+pub static TSV_USE_QUANTIZED_SORT: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -108,6 +109,21 @@ pub fn init() {
         -1,
         1024,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.use_quantized_sort".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Use quantized vector distance for sorting in parallel builds".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When enabled, stores quantized vectors in shared memory during parallel builds and uses quantized distance for sorting queries. This can improve performance but uses more memory.".as_pg_cstr())
+        },
+        &TSV_USE_QUANTIZED_SORT,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }

@@ -335,4 +335,17 @@ impl Storage for PlainStorage<'_> {
     fn get_has_labels(&self) -> bool {
         false
     }
+
+    fn quantize_vector(&self, _vector: &[f32]) -> Option<Vec<u64>> {
+        None
+    }
+
+    fn get_quantized_vector<S: StatsNodeRead>(
+        &self,
+        _index_pointer: IndexPointer,
+        _meta_page: &MetaPage,
+        _stats: &mut S,
+    ) -> Option<Vec<u64>> {
+        None
+    }
 }

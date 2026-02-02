@@ -147,6 +147,10 @@ impl SbqSearchDistanceMeasure {
         Self { vec, query }
     }
 
+    pub fn query(&self) -> Option<&LabeledVector> {
+        Some(&self.query)
+    }
+
     pub fn calculate_bq_distance<S: StatsDistanceComparison>(
         &self,
         bq_vector: &[SbqVectorElement],

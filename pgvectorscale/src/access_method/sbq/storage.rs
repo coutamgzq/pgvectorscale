@@ -456,6 +456,21 @@ impl Storage for SbqSpeedupStorage<'_> {
     fn get_has_labels(&self) -> bool {
         self.has_labels
     }
+
+    fn quantize_vector(&self, vector: &[f32]) -> Option<Vec<u64>> {
+        Some(self.quantizer.quantize(vector))
+    }
+
+    fn get_quantized_vector<S: StatsNodeRead>(
+        &self,
+        index_pointer: IndexPointer,
+        _meta_page: &MetaPage,
+        stats: &mut S,
+    ) -> Option<Vec<u64>> {
+        let rn = unsafe { SbqNode::read(self.index, index_pointer, self.has_labels, stats) };
+        let node = rn.get_archived_node();
+        Some(node.get_bq_vector().to_vec())
+    }
 }
 
 pub type SbqSpeedupStorageLsnPrivateData = PhantomData<bool>; //no data stored

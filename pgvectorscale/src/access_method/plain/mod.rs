@@ -19,6 +19,12 @@ pub enum PlainDistanceMeasure {
 }
 
 impl PlainDistanceMeasure {
+    pub fn query(&self) -> Option<&LabeledVector> {
+        match self {
+            PlainDistanceMeasure::Full(query) => Some(query),
+        }
+    }
+
     pub fn calculate_distance<S: StatsDistanceComparison>(
         distance_fn: DistanceFn,
         query: &[f32],

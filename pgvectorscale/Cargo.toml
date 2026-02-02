@@ -51,3 +51,10 @@ harness = false
 [[bench]]
 name = "lsr"
 harness = false
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
