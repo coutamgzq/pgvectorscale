@@ -1079,8 +1079,18 @@ fn build_callback_internal<S: Storage>(
 
     state.ntuples += 1;
 
+    let distance_type = state.graph.get_meta_page().get_distance_type();
+    let vector_slice = match distance_type {
+        DistanceType::Cosine => {
+            let mut normalized = vector.vec().to_index_slice().to_vec();
+            crate::access_method::distance::preprocess_cosine(&mut normalized);
+            normalized
+        }
+        _ => vector.vec().to_index_slice().to_vec(),
+    };
+
     let index_pointer = storage.create_node(
-        vector.vec().to_index_slice(),
+        &vector_slice,
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1123,9 +1133,18 @@ fn build_callback_parallel_internal<S: Storage>(
 
     state.increment_ntuples();
 
-    // Create node using local tape - PostgreSQL page locking handles concurrency
+    let distance_type = state.graph.get_meta_page().get_distance_type();
+    let vector_slice = match distance_type {
+        DistanceType::Cosine => {
+            let mut normalized = vector.vec().to_index_slice().to_vec();
+            crate::access_method::distance::preprocess_cosine(&mut normalized);
+            normalized
+        }
+        _ => vector.vec().to_index_slice().to_vec(),
+    };
+
     let index_pointer = storage.create_node(
-        vector.vec().to_index_slice(),
+        &vector_slice,
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1133,8 +1152,6 @@ fn build_callback_parallel_internal<S: Storage>(
         &mut state.local_stats,
     );
 
-    // Insert node into graph with parallel build mode enabled
-    // PostgreSQL page locking handles concurrency when finalizing nodes
     state.graph.insert(
         index,
         index_pointer,

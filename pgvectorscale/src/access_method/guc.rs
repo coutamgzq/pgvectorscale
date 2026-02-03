@@ -20,7 +20,7 @@ pub fn init() {
         },
         &TSV_QUERY_SEARCH_LIST_SIZE,
         1,
-        10000,
+        70000,
         GucContext::Userset,
         GucFlags::default(),
     );

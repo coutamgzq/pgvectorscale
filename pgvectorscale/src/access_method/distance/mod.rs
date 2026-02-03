@@ -192,7 +192,6 @@ pub fn distance_inner_product(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn distance_cosine(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    //note safety is guraranteed by compile_error above
     unsafe {
         return distance_x86::distance_cosine_x86_avx2(a, b);
     }
