@@ -32,6 +32,7 @@ pgrx = "=0.16.1"
 rkyv = { version = "0.7.43", features = ["validation"] }
 simdeez = { version = "1.0.8" }
 rand = { version = "0.8", features = ["small_rng"] }
+rayon = "1.8"
 pgvectorscale_derive = { path = "pgvectorscale_derive" }
 semver = "1.0.24"
 serial_test = "3.2.0"
