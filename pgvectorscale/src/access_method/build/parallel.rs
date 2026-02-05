@@ -14,6 +14,7 @@ pub fn initial_start_nodes_count() -> usize {
 
 pub const SHM_TOC_SHARED_KEY: u64 = 0xD000000000000001;
 pub const SHM_TOC_TABLESCANDESC_KEY: u64 = 0xD000000000000002;
+pub const SHM_TOC_CLUSTER_DATA_KEY: u64 = 0xD000000000000003;
 
 /// Cleans up a parallel context when we're done with it.
 pub unsafe fn cleanup_parallel_context(

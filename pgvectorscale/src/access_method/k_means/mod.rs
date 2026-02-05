@@ -4,7 +4,6 @@ pub mod quick_centers;
 
 use kmeans1d::kmeans1d;
 use lloyd::LloydKMeans;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub fn k_means(
     c: usize,
@@ -60,6 +59,7 @@ pub fn k_means_lookup(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
     result.1
 }
 
+#[allow(dead_code)]
 pub fn k_means_lookup_many(vector: &[f32], centroids: &[Vec<f32>]) -> Vec<(f32, usize)> {
     assert!(!centroids.is_empty());
     let mut seq = Vec::new();

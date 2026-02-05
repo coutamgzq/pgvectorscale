@@ -1,6 +1,6 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 const DELTA: f32 = 1e-6;
 

@@ -11,6 +11,7 @@ use pgrx::*;
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
 use crate::access_method::graph::Graph;
+use crate::access_method::k_means;
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
@@ -54,6 +55,34 @@ enum StorageBuildStateParallel<'a, 'b, 'c> {
         &'c mut BuildStateParallel<'b>,
     ),
     Plain(&'a mut PlainStorage<'b>, &'c mut BuildStateParallel<'b>),
+}
+
+/// Storage build state with cluster filtering
+enum ClusterFilterState<'a, 'b, 'c, 'd, 'e> {
+    SbqSpeedup(
+        &'a mut SbqSpeedupStorage<'b>,
+        &'c mut BuildState<'d>,
+        &'e ClusterFilterContext<'a, 'b>,
+    ),
+    Plain(
+        &'a mut PlainStorage<'b>,
+        &'c mut BuildState<'d>,
+        &'e ClusterFilterContext<'a, 'b>,
+    ),
+}
+
+/// Storage build state with cluster filtering for parallel builds
+enum ClusterFilterStateParallel<'a, 'b, 'c, 'e> {
+    SbqSpeedup(
+        &'a mut SbqSpeedupStorage<'b>,
+        &'c mut BuildStateParallel<'b>,
+        &'e ClusterFilterContext<'a, 'b>,
+    ),
+    Plain(
+        &'a mut PlainStorage<'b>,
+        &'c mut BuildStateParallel<'b>,
+        &'e ClusterFilterContext<'a, 'b>,
+    ),
 }
 
 struct BuildState<'a> {
@@ -245,6 +274,35 @@ struct ParallelBuildInfo {
     tablescandesc: *mut pg_sys::ParallelTableScanDescData,
 }
 
+/// Cluster data for parallel builds
+#[derive(Debug)]
+#[cfg_attr(not(feature = "build_parallel"), allow(dead_code))]
+struct ClusterParallelData {
+    pcxt: *mut pg_sys::ParallelContext,
+    snapshot: *mut pg_sys::SnapshotData,
+    centroids: Vec<Vec<f32>>,
+    cluster_assignments: Vec<usize>,
+}
+
+/// Structure to collect vectors for k-means clustering
+struct VectorCollector {
+    vectors: Vec<Vec<f32>>,
+    heap_tids: Vec<pg_sys::ItemPointerData>,
+}
+
+/// Structure to collect vectors for k-means clustering with meta_page
+struct VectorCollectorWithMeta<'a> {
+    collector: VectorCollector,
+    meta_page: &'a MetaPage,
+}
+
+/// Structure to pass cluster filtering information to callbacks
+struct ClusterFilterContext<'a, 'b> {
+    heap_tids: &'a [pg_sys::ItemPointerData],
+    cluster_assignments: &'b [usize],
+    cluster_id: usize,
+}
+
 fn get_meta_page(
     indexrel: pg_sys::Relation,
     index_relation: &PgRelation,
@@ -312,33 +370,275 @@ pub extern "C-unwind" fn ambuild(
         opt.get_storage_type(),
     );
 
-    // Train quantizer before doing anything in parallel
-    let write_stats =
-        maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
-    unsafe {
-        meta_page.store(&index_relation, false);
-    };
+    let num_clusters = crate::access_method::guc::TSV_NUM_CLUSTERS.get() as usize;
+    let use_clustering = num_clusters > 1;
 
-    let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
-    let workers = if cfg!(feature = "build_parallel")
-        && !meta_page.has_labels()
-        && meta_page.get_storage_type() == StorageType::SbqCompression
-    {
-        // Check if we have a forced worker count setting
-        let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
-        if forced_workers >= 0 {
-            forced_workers as usize
-        } else {
-            // Only use parallel building if we have enough vectors to justify it
-            if heap_tuples >= min_vectors_for_parallel_build() {
-                unsafe { (*index_info).ii_ParallelWorkers as usize }
-            } else {
-                0
-            }
+    if use_clustering {
+        notice!("Using k-means clustering with {} clusters", num_clusters);
+    }
+
+    let mut total_ntuples = 0;
+
+    if use_clustering {
+        unsafe {
+            pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_COLLECTING_VECTORS);
         }
+
+        let mut collector_with_meta = unsafe {
+            VectorCollectorWithMeta {
+                collector: VectorCollector {
+                    vectors: Vec::new(),
+                    heap_tids: Vec::new(),
+                },
+                meta_page: &*(&meta_page as *const _),
+            }
+        };
+
+        unsafe {
+            pg_sys::IndexBuildHeapScan(
+                heap_relation.as_ptr(),
+                index_relation.as_ptr(),
+                index_info,
+                Some(build_callback_collect_vectors),
+                &mut collector_with_meta,
+            );
+        }
+
+        let num_vectors = collector_with_meta.collector.vectors.len();
+        notice!("Collected {} vectors for k-means clustering", num_vectors);
+
+        if num_vectors < num_clusters {
+            warning!(
+                "Number of vectors ({}) is less than number of clusters ({}). Using {} clusters instead.",
+                num_vectors, num_clusters, num_vectors
+            );
+        }
+
+        unsafe {
+            pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_CLUSTERING);
+        }
+
+        let actual_num_clusters = num_clusters.min(num_vectors);
+        let centroids = k_means::k_means(
+            actual_num_clusters,
+            collector_with_meta.collector.vectors.clone(),
+            false,
+            100,
+            true,
+        );
+
+        notice!("K-means clustering completed with {} centroids", centroids.len());
+
+        let mut cluster_assignments = vec![0usize; num_vectors];
+        for (i, vector) in collector_with_meta.collector.vectors.iter().enumerate() {
+            cluster_assignments[i] = k_means::k_means_lookup(vector, &centroids);
+        }
+
+        let cluster_stats: Vec<_> = (0..actual_num_clusters)
+            .map(|cluster_id| {
+                let count = cluster_assignments.iter().filter(|&&x| x == cluster_id).count();
+                (cluster_id, count)
+            })
+            .collect();
+
+        notice!("Cluster distribution:");
+        for (cluster_id, count) in &cluster_stats {
+            notice!("  Cluster {}: {} vectors", cluster_id, count);
+        }
+
+        unsafe {
+            pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
+        }
+
+        let write_stats = maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
+        unsafe {
+            meta_page.store(&index_relation, false);
+        };
+
+        let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
+
+        let workers = if cfg!(feature = "build_parallel")
+            && !meta_page.has_labels()
+            && meta_page.get_storage_type() == StorageType::SbqCompression
+        {
+            let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
+            if forced_workers >= 0 {
+                forced_workers as usize
+            } else {
+                if heap_tuples >= min_vectors_for_parallel_build() {
+                    unsafe { (*index_info).ii_ParallelWorkers as usize }
+                } else {
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        let is_concurrent = unsafe { (*index_info).ii_Concurrent };
+
+        let parallel_data = if workers > 0 {
+            notice!("Parallel build with {} workers for {} clusters", workers, actual_num_clusters);
+            unsafe {
+                pg_sys::EnterParallelMode();
+
+                let pcxt = pg_sys::CreateParallelContext(
+                    crate::EXTENSION_NAME,
+                    PARALLEL_BUILD_CLUSTER_MAIN,
+                    workers as i32,
+                );
+                let snapshot = if is_concurrent {
+                    pg_sys::RegisterSnapshot(pg_sys::GetTransactionSnapshot())
+                } else {
+                    &raw mut pg_sys::SnapshotAnyData
+                };
+
+                parallel::toc_estimate_single_chunk(pcxt, size_of::<ParallelShared>());
+                parallel::toc_estimate_single_chunk(pcxt, size_of::<ClusterParallelData>());
+                let tablescandesc_size_estimate =
+                    pg_sys::table_parallelscan_estimate(heaprel, snapshot);
+                parallel::toc_estimate_single_chunk(pcxt, tablescandesc_size_estimate);
+
+                pg_sys::InitializeParallelDSM(pcxt);
+                if (*pcxt).seg.is_null() {
+                    parallel::cleanup_parallel_context(pcxt, snapshot);
+                    None
+                } else {
+                    let parallel_shared =
+                        pg_sys::shm_toc_allocate((*pcxt).toc, size_of::<ParallelShared>())
+                            .cast::<ParallelShared>();
+                    let shared_state = ParallelShared {
+                        params: ParallelSharedParams {
+                            heaprelid: heap_relation.rd_id,
+                            indexrelid: index_relation.rd_id,
+                            is_concurrent,
+                            worker_count: workers as usize,
+                            total_vectors: heap_tuples,
+                        },
+                        build_state: ParallelBuildState {
+                            ntuples: AtomicUsize::new(0),
+                            start_nodes_initialized: AtomicBool::new(false),
+                            initializing_worker_done: AtomicBool::new(false),
+                            initialization_cv: std::mem::zeroed(),
+                        },
+                    };
+                    parallel_shared.write(shared_state);
+
+                    pg_sys::ConditionVariableInit(
+                        &raw mut (*parallel_shared).build_state.initialization_cv,
+                    );
+
+                    let cluster_data =
+                        pg_sys::shm_toc_allocate((*pcxt).toc, size_of::<ClusterParallelData>())
+                            .cast::<ClusterParallelData>();
+
+                    let cluster_parallel_data = ClusterParallelData {
+                        pcxt: std::ptr::null_mut(),
+                        snapshot: std::ptr::null_mut(),
+                        centroids: centroids.clone(),
+                        cluster_assignments: cluster_assignments.clone(),
+                    };
+
+                    cluster_data.write(cluster_parallel_data);
+
+                    let tablescandesc =
+                        pg_sys::shm_toc_allocate((*pcxt).toc, tablescandesc_size_estimate)
+                            .cast::<pg_sys::ParallelTableScanDescData>();
+                    pg_sys::table_parallelscan_initialize(heaprel, tablescandesc, snapshot);
+
+                    pg_sys::shm_toc_insert(
+                        (*pcxt).toc,
+                        parallel::SHM_TOC_SHARED_KEY,
+                        parallel_shared.cast(),
+                    );
+                    pg_sys::shm_toc_insert(
+                        (*pcxt).toc,
+                        parallel::SHM_TOC_CLUSTER_DATA_KEY,
+                        cluster_data.cast(),
+                    );
+                    pg_sys::shm_toc_insert(
+                        (*pcxt).toc,
+                        parallel::SHM_TOC_TABLESCANDESC_KEY,
+                        tablescandesc.cast(),
+                    );
+
+                    pg_sys::LaunchParallelWorkers(pcxt);
+                    if (*pcxt).nworkers_launched == 0 {
+                        warning!("No workers launched");
+                        parallel::cleanup_parallel_context(pcxt, snapshot);
+                        None
+                    } else {
+                        pg_sys::WaitForParallelWorkersToAttach(pcxt);
+                        Some(ClusterParallelData { pcxt, snapshot, centroids: Vec::new(), cluster_assignments: Vec::new() })
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        let ntuples = if let Some(ClusterParallelData { pcxt, snapshot, centroids: _, cluster_assignments: _ }) = parallel_data {
+            unsafe {
+                pg_sys::WaitForParallelWorkersToFinish(pcxt);
+                let parallel_shared: *mut ParallelShared =
+                    pg_sys::shm_toc_lookup((*pcxt).toc, parallel::SHM_TOC_SHARED_KEY, false)
+                        .cast::<ParallelShared>();
+                let ntuples = (*parallel_shared)
+                    .build_state
+                    .ntuples
+                    .load(Ordering::Relaxed);
+                parallel::cleanup_parallel_context(pcxt, snapshot);
+                ntuples
+            }
+        } else {
+            do_heap_scan_with_clustering(
+                index_info,
+                &heap_relation,
+                &index_relation,
+                &mut meta_page,
+                write_stats,
+                None,
+                workers,
+                &collector_with_meta.collector.heap_tids,
+                &cluster_assignments,
+                &centroids,
+                actual_num_clusters,
+            )
+        };
+
+        let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
+        result.heap_tuples = ntuples as f64;
+        result.index_tuples = ntuples as f64;
+
+        result.into_pg()
     } else {
-        0
-    };
+        let write_stats =
+            maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
+        unsafe {
+            meta_page.store(&index_relation, false);
+        };
+
+        let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
+
+        let workers = if cfg!(feature = "build_parallel")
+            && !meta_page.has_labels()
+            && meta_page.get_storage_type() == StorageType::SbqCompression
+        {
+            // Check if we have a forced worker count setting
+            let forced_workers = crate::access_method::guc::TSV_FORCE_PARALLEL_WORKERS.get();
+            if forced_workers >= 0 {
+                forced_workers as usize
+            } else {
+                // Only use parallel building if we have enough vectors to justify it
+                if heap_tuples >= min_vectors_for_parallel_build() {
+                    unsafe { (*index_info).ii_ParallelWorkers as usize }
+                } else {
+                    0
+                }
+            }
+        } else {
+            0
+        };
     let is_concurrent = unsafe { (*index_info).ii_Concurrent };
     struct ParallelData {
         pcxt: *mut pg_sys::ParallelContext,
@@ -457,6 +757,7 @@ pub extern "C-unwind" fn ambuild(
     result.index_tuples = ntuples as f64;
 
     result.into_pg()
+    }
 }
 
 #[pg_guard]
@@ -614,6 +915,117 @@ fn maybe_train_quantizer(
 }
 
 const PARALLEL_BUILD_MAIN: *const c_char = c"_vectorscale_build_main".as_ptr();
+const PARALLEL_BUILD_CLUSTER_MAIN: *const c_char = c"_vectorscale_build_cluster_main".as_ptr();
+
+#[pg_guard]
+#[unsafe(no_mangle)]
+#[cfg(feature = "build_parallel")]
+pub extern "C-unwind" fn _vectorscale_build_cluster_main(
+    _seg: *mut pg_sys::dsm_segment,
+    shm_toc: *mut pg_sys::shm_toc,
+) {
+    let status_flags = unsafe { (*pg_sys::MyProc).statusFlags };
+    assert!(
+        status_flags == 0 || status_flags == pg_sys::PROC_IN_SAFE_IC as u8,
+        "Status flags for an index build process must be unset or PROC_IN_SAFE_IC (in a safe index creation)"
+    );
+
+    let parallel_shared: *mut ParallelShared = unsafe {
+        pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_SHARED_KEY, false)
+            .cast::<ParallelShared>()
+    };
+    let cluster_data: *mut ClusterParallelData = unsafe {
+        pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_CLUSTER_DATA_KEY, false)
+            .cast::<ClusterParallelData>()
+    };
+    let tablescandesc = unsafe {
+        pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_TABLESCANDESC_KEY, false)
+            .cast::<pg_sys::ParallelTableScanDescData>()
+    };
+
+    let params = unsafe {
+        (*parallel_shared).params
+    };
+
+    let should_initialize = unsafe {
+        (*parallel_shared)
+            .build_state
+            .start_nodes_initialized
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    };
+
+    if !should_initialize {
+        unsafe {
+            loop {
+                let ntuples = (*parallel_shared)
+                    .build_state
+                    .ntuples
+                    .load(Ordering::Relaxed);
+                let init_done = (*parallel_shared)
+                    .build_state
+                    .initializing_worker_done
+                    .load(Ordering::Relaxed);
+
+                if ntuples >= parallel::initial_start_nodes_count() || init_done {
+                    break;
+                }
+
+                pg_sys::ConditionVariableSleep(
+                    &raw mut (*parallel_shared).build_state.initialization_cv,
+                    pg_sys::PG_WAIT_EXTENSION,
+                );
+            }
+        }
+    }
+
+    let (heap_lockmode, index_lockmode) = if params.is_concurrent {
+        (
+            pg_sys::ShareLock as pg_sys::LOCKMODE,
+            pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+        )
+    } else {
+        (
+            pg_sys::ShareUpdateExclusiveLock as pg_sys::LOCKMODE,
+            pg_sys::RowExclusiveLock as pg_sys::LOCKMODE,
+        )
+    };
+
+    let heaprel = unsafe { pg_sys::table_open(params.heaprelid, heap_lockmode) };
+    let indexrel = unsafe { pg_sys::index_open(params.indexrelid, index_lockmode) };
+    let index_info = unsafe { pg_sys::BuildIndexInfo(indexrel) };
+    let heap_relation = unsafe { PgRelation::from_pg(heaprel) };
+    let index_relation = unsafe { PgRelation::from_pg(indexrel) };
+    let mut meta_page = MetaPage::fetch(&index_relation);
+
+    let centroids = unsafe { (*cluster_data).centroids.clone() };
+    let cluster_assignments = unsafe { (*cluster_data).cluster_assignments.clone() };
+    let num_clusters = centroids.len();
+
+    do_heap_scan_with_clustering(
+        index_info,
+        &heap_relation,
+        &index_relation,
+        &mut meta_page,
+        WriteStats::default(),
+        Some(ParallelBuildInfo {
+            parallel_shared,
+            is_initializing_worker: should_initialize,
+            tablescandesc,
+        }),
+        params.worker_count,
+        &[],
+        &cluster_assignments,
+        &centroids,
+        num_clusters,
+    );
+
+    unsafe {
+        pg_sys::index_close(indexrel, index_lockmode);
+        pg_sys::table_close(heaprel, heap_lockmode);
+    }
+}
+
 #[pg_guard]
 #[unsafe(no_mangle)]
 #[cfg(feature = "build_parallel")]
@@ -724,26 +1136,54 @@ fn do_heap_scan(
     parallel_build_info: Option<ParallelBuildInfo>,
     worker_count: usize,
 ) -> usize {
+    do_heap_scan_with_clustering(
+        index_info,
+        heap_relation,
+        index_relation,
+        &mut meta_page,
+        write_stats,
+        parallel_build_info,
+        worker_count,
+        &[],
+        &[],
+        &[],
+        0,
+    )
+}
+
+fn do_heap_scan_with_clustering(
+    index_info: *mut pg_sys::IndexInfo,
+    heap_relation: &PgRelation,
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+    mut write_stats: WriteStats,
+    parallel_build_info: Option<ParallelBuildInfo>,
+    worker_count: usize,
+    heap_tids: &[pg_sys::ItemPointerData],
+    cluster_assignments: &[usize],
+    centroids: &[Vec<f32>],
+    num_clusters: usize,
+) -> usize {
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
     }
 
     let storage = meta_page.get_storage_type();
+    let use_clustering = num_clusters > 0 && !centroids.is_empty();
 
     if let Some(parallel_info) = parallel_build_info {
         let shared_state = unsafe { &*parallel_info.parallel_shared };
 
-        // In parallel mode, timing is handled locally by each worker
-        // No shared timing state needed across processes
-
-        let graph = Graph::new(
-            GraphNeighborStore::Builder(BuilderNeighborCache::new(
-                BUILDER_NEIGHBOR_CACHE_SIZE,
-                &meta_page,
-                worker_count,
-            )),
-            &mut meta_page,
-        );
+        let graph = unsafe {
+            Graph::new(
+                GraphNeighborStore::Builder(BuilderNeighborCache::new(
+                    BUILDER_NEIGHBOR_CACHE_SIZE,
+                    meta_page,
+                    worker_count,
+                )),
+                &mut *(meta_page as *mut _),
+            )
+        };
 
         match storage {
             StorageType::Plain => {
@@ -773,8 +1213,6 @@ fn do_heap_scan(
                     );
                 }
 
-                // In parallel mode, nodes are finalized during insertion via streaming
-                // Just need to handle any remaining cached nodes and update meta page
                 finalize_remaining_parallel_nodes(&mut plain, bs, index_relation, write_stats)
             }
             StorageType::SbqCompression => {
@@ -808,28 +1246,20 @@ fn do_heap_scan(
                     );
                 }
 
-                unsafe {
-                    pgstat_progress_update_param(
-                        PROGRESS_CREATE_IDX_SUBPHASE,
-                        BUILD_PHASE_FINALIZING_GRAPH,
-                    );
-                }
-
-                // In parallel mode, nodes are finalized during insertion via streaming
-                // Just need to handle any remaining cached nodes and update meta page
                 finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
             }
         }
     } else {
-        // Serial build: use local state
-        let graph = Graph::new(
-            GraphNeighborStore::Builder(BuilderNeighborCache::new(
-                BUILDER_NEIGHBOR_CACHE_SIZE,
-                &meta_page,
-                worker_count,
-            )),
-            &mut meta_page,
-        );
+        let graph = unsafe {
+            Graph::new(
+                GraphNeighborStore::Builder(BuilderNeighborCache::new(
+                    BUILDER_NEIGHBOR_CACHE_SIZE,
+                    meta_page,
+                    worker_count,
+                )),
+                &mut *(meta_page as *mut _),
+            )
+        };
 
         match storage {
             StorageType::Plain => {
@@ -842,17 +1272,38 @@ fn do_heap_scan(
                 let mut bs = BuildState::new(index_relation, graph, page_type);
                 let mut state = StorageBuildState::Plain(&mut plain, &mut bs);
 
-                unsafe {
-                    pg_sys::IndexBuildHeapScan(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback),
-                        &mut state,
-                    );
-                }
+                if use_clustering {
+                    let filter_context = ClusterFilterContext {
+                        heap_tids,
+                        cluster_assignments,
+                        cluster_id: 0,
+                    };
+                    let mut filter_state = ClusterFilterState::Plain(&mut plain, &mut bs, &filter_context);
 
-                finalize_index_build(&mut plain, bs, index_relation, write_stats)
+                    unsafe {
+                        pg_sys::IndexBuildHeapScan(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_cluster),
+                            &mut filter_state,
+                        );
+                    }
+
+                    finalize_index_build(&mut plain, bs, index_relation, write_stats)
+                } else {
+                    unsafe {
+                        pg_sys::IndexBuildHeapScan(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback),
+                            &mut state,
+                        );
+                    }
+
+                    finalize_index_build(&mut plain, bs, index_relation, write_stats)
+                }
             }
             StorageType::SbqCompression => {
                 let mut bq = unsafe {
@@ -868,24 +1319,38 @@ fn do_heap_scan(
                 let mut bs = BuildState::new(index_relation, graph, page_type);
                 let mut state = StorageBuildState::SbqSpeedup(&mut bq, &mut bs);
 
-                unsafe {
-                    pg_sys::IndexBuildHeapScan(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback),
-                        &mut state,
-                    );
-                }
+                if use_clustering {
+                    let filter_context = ClusterFilterContext {
+                        heap_tids,
+                        cluster_assignments,
+                        cluster_id: 0,
+                    };
+                    let mut filter_state = ClusterFilterState::SbqSpeedup(&mut bq, &mut bs, &filter_context);
 
-                unsafe {
-                    pgstat_progress_update_param(
-                        PROGRESS_CREATE_IDX_SUBPHASE,
-                        BUILD_PHASE_FINALIZING_GRAPH,
-                    );
-                }
+                    unsafe {
+                        pg_sys::IndexBuildHeapScan(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_cluster),
+                            &mut filter_state,
+                        );
+                    }
 
-                finalize_index_build(&mut bq, bs, index_relation, write_stats)
+                    finalize_index_build(&mut bq, bs, index_relation, write_stats)
+                } else {
+                    unsafe {
+                        pg_sys::IndexBuildHeapScan(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback),
+                            &mut state,
+                        );
+                    }
+
+                    finalize_index_build(&mut bq, bs, index_relation, write_stats)
+                }
             }
         }
     }
@@ -957,6 +1422,23 @@ fn finalize_index_build<S: Storage>(
     notice!("Indexed {} tuples", ntuples);
 
     ntuples
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn build_callback_collect_vectors(
+    _index: pg_sys::Relation,
+    ctid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    let collector_with_meta = (state as *mut VectorCollectorWithMeta).as_mut().unwrap();
+    let vec = PgVector::from_pg_parts(values, isnull, 0, collector_with_meta.meta_page, true, false);
+    if let Some(vec) = vec {
+        collector_with_meta.collector.vectors.push(vec.to_index_slice().to_vec());
+        collector_with_meta.collector.heap_tids.push(*ctid);
+    }
 }
 
 #[pg_guard]
@@ -1168,13 +1650,340 @@ fn build_callback_parallel_internal<S: Storage>(
     }
 }
 
+fn maybe_train_quantizer_for_cluster(
+    _index_info: *mut pg_sys::IndexInfo,
+    _heap_relation: &PgRelation,
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+    cluster_vectors: &[Vec<f32>],
+) -> WriteStats {
+    let mut write_stats = WriteStats::default();
+    let storage = meta_page.get_storage_type();
+    match storage {
+        StorageType::Plain => {}
+        StorageType::SbqCompression => {
+            let mut quantizer = SbqQuantizer::new(meta_page);
+            quantizer.start_training(meta_page);
+
+            for vector in cluster_vectors {
+                quantizer.add_sample(vector);
+            }
+
+            quantizer.finish_training();
+            if quantizer.use_mean {
+                let index_pointer =
+                    unsafe { SbqMeans::store(index_relation, &quantizer, &mut write_stats) };
+                meta_page.set_quantizer_metadata_pointer(index_pointer);
+            }
+        }
+    }
+    write_stats
+}
+
+fn build_index_for_cluster(
+    index_info: *mut pg_sys::IndexInfo,
+    heap_relation: &PgRelation,
+    index_relation: &PgRelation,
+    mut meta_page: MetaPage,
+    mut write_stats: WriteStats,
+    parallel_build_info: Option<ParallelBuildInfo>,
+    worker_count: usize,
+    heap_tids: &[pg_sys::ItemPointerData],
+    cluster_assignments: &[usize],
+    cluster_id: usize,
+) -> usize {
+    unsafe {
+        pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
+    }
+
+    let storage = meta_page.get_storage_type();
+
+    if let Some(parallel_info) = parallel_build_info {
+        let shared_state = unsafe { &*parallel_info.parallel_shared };
+
+        let filter_context = ClusterFilterContext {
+            heap_tids,
+            cluster_assignments,
+            cluster_id,
+        };
+
+        let graph = Graph::new(
+            GraphNeighborStore::Builder(BuilderNeighborCache::new(
+                BUILDER_NEIGHBOR_CACHE_SIZE,
+                &meta_page,
+                worker_count,
+            )),
+            &mut meta_page,
+        );
+
+        match storage {
+            StorageType::Plain => {
+                let mut plain = PlainStorage::new_for_build(
+                    index_relation,
+                    heap_relation,
+                    graph.get_meta_page(),
+                );
+                let page_type = PlainStorage::page_type();
+                let mut bs = BuildStateParallel::new(
+                    index_relation,
+                    graph,
+                    page_type,
+                    shared_state,
+                    parallel_info.is_initializing_worker,
+                );
+                let _state = StorageBuildStateParallel::Plain(&mut plain, &mut bs);
+                let mut filter_state = ClusterFilterStateParallel::Plain(&mut plain, &mut bs, &filter_context);
+
+                unsafe {
+                    IndexBuildHeapScanParallel(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback_parallel_cluster),
+                        &mut filter_state,
+                        parallel_info.tablescandesc,
+                    );
+                }
+
+                finalize_remaining_parallel_nodes(&mut plain, bs, index_relation, write_stats)
+            }
+            StorageType::SbqCompression => {
+                let mut bq = unsafe {
+                    SbqSpeedupStorage::new_for_build(
+                        index_relation,
+                        heap_relation,
+                        graph.get_meta_page(),
+                        &mut write_stats,
+                    )
+                };
+
+                let page_type = SbqSpeedupStorage::page_type();
+                let mut bs = BuildStateParallel::new(
+                    index_relation,
+                    graph,
+                    page_type,
+                    shared_state,
+                    parallel_info.is_initializing_worker,
+                );
+                let _state = StorageBuildStateParallel::SbqSpeedup(&mut bq, &mut bs);
+                let mut filter_state = ClusterFilterStateParallel::SbqSpeedup(&mut bq, &mut bs, &filter_context);
+
+                unsafe {
+                    IndexBuildHeapScanParallel(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback_parallel_cluster),
+                        &mut filter_state,
+                        parallel_info.tablescandesc,
+                    );
+                }
+
+                finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
+            }
+        }
+    } else {
+        let filter_context = ClusterFilterContext {
+            heap_tids,
+            cluster_assignments,
+            cluster_id,
+        };
+
+        let graph = Graph::new(
+            GraphNeighborStore::Builder(BuilderNeighborCache::new(
+                BUILDER_NEIGHBOR_CACHE_SIZE,
+                &meta_page,
+                worker_count,
+            )),
+            &mut meta_page,
+        );
+
+        match storage {
+            StorageType::Plain => {
+                let mut plain = PlainStorage::new_for_build(
+                    index_relation,
+                    heap_relation,
+                    graph.get_meta_page(),
+                );
+                let page_type = PlainStorage::page_type();
+                let mut bs = BuildState::new(index_relation, graph, page_type);
+                let _state = StorageBuildState::Plain(&mut plain, &mut bs);
+                let mut filter_state = ClusterFilterState::Plain(&mut plain, &mut bs, &filter_context);
+
+                unsafe {
+                    pg_sys::IndexBuildHeapScan(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback_cluster),
+                        &mut filter_state,
+                    );
+                }
+
+                finalize_index_build(&mut plain, bs, index_relation, write_stats)
+            }
+            StorageType::SbqCompression => {
+                let mut bq = unsafe {
+                    SbqSpeedupStorage::new_for_build(
+                        index_relation,
+                        heap_relation,
+                        graph.get_meta_page(),
+                        &mut write_stats,
+                    )
+                };
+
+                let page_type = SbqSpeedupStorage::page_type();
+                let mut bs = BuildState::new(index_relation, graph, page_type);
+                let _state = StorageBuildState::SbqSpeedup(&mut bq, &mut bs);
+                let mut filter_state = ClusterFilterState::SbqSpeedup(&mut bq, &mut bs, &filter_context);
+
+                unsafe {
+                    pg_sys::IndexBuildHeapScan(
+                        heap_relation.as_ptr(),
+                        index_relation.as_ptr(),
+                        index_info,
+                        Some(build_callback_cluster),
+                        &mut filter_state,
+                    );
+                }
+
+                finalize_index_build(&mut bq, bs, index_relation, write_stats)
+            }
+        }
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn build_callback_cluster(
+    index: pg_sys::Relation,
+    ctid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    let heap_pointer = ItemPointer::with_item_pointer_data(*ctid);
+    let index_relation = PgRelation::from_pg(index);
+    let state = (state as *mut ClusterFilterState).as_mut().unwrap();
+    
+    let filter_context = match state {
+        ClusterFilterState::SbqSpeedup(_, _, ctx) => ctx,
+        ClusterFilterState::Plain(_, _, ctx) => ctx,
+    };
+    
+    let vector_index = filter_context
+        .heap_tids
+        .iter()
+        .position(|tid| {
+            let tid_block = unsafe { pgrx::itemptr::item_pointer_get_block_number(tid) };
+            let tid_offset = unsafe { pgrx::itemptr::item_pointer_get_offset_number(tid) };
+            tid_block == heap_pointer.block_number && tid_offset == heap_pointer.offset
+        });
+    
+    if let Some(idx) = vector_index {
+        if filter_context.cluster_assignments[idx] != filter_context.cluster_id {
+            return;
+        }
+    }
+    
+    match state {
+        ClusterFilterState::SbqSpeedup(bq, state, _) => {
+            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
+            if let Some(vec) = vec {
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
+            }
+        }
+        ClusterFilterState::Plain(plain, state, _) => {
+            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
+            if let Some(vec) = vec {
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
+            }
+        }
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn build_callback_parallel_cluster(
+    index: pg_sys::Relation,
+    ctid: pg_sys::ItemPointer,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    _tuple_is_alive: bool,
+    state: *mut std::os::raw::c_void,
+) {
+    let heap_pointer = ItemPointer::with_item_pointer_data(*ctid);
+    let index_relation = PgRelation::from_pg(index);
+    let state = (state as *mut ClusterFilterStateParallel).as_mut().unwrap();
+    
+    let filter_context = match state {
+        ClusterFilterStateParallel::SbqSpeedup(_, _, ctx) => ctx,
+        ClusterFilterStateParallel::Plain(_, _, ctx) => ctx,
+    };
+    
+    let vector_index = filter_context
+        .heap_tids
+        .iter()
+        .position(|tid| {
+            let tid_block = unsafe { pgrx::itemptr::item_pointer_get_block_number(tid) };
+            let tid_offset = unsafe { pgrx::itemptr::item_pointer_get_offset_number(tid) };
+            tid_block == heap_pointer.block_number && tid_offset == heap_pointer.offset
+        });
+    
+    if let Some(idx) = vector_index {
+        if filter_context.cluster_assignments[idx] != filter_context.cluster_id {
+            return;
+        }
+    }
+    
+    match state {
+        ClusterFilterStateParallel::SbqSpeedup(bq, state, _) => {
+            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
+            if let Some(vec) = vec {
+                let spare_vec =
+                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
+                        .unwrap();
+                build_callback_parallel_memory_wrapper(
+                    &index_relation,
+                    heap_pointer,
+                    vec,
+                    spare_vec,
+                    state,
+                    *bq,
+                );
+            }
+        }
+        ClusterFilterStateParallel::Plain(plain, state, _) => {
+            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
+            if let Some(vec) = vec {
+                let spare_vec =
+                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
+                        .unwrap();
+                build_callback_parallel_memory_wrapper(
+                    &index_relation,
+                    heap_pointer,
+                    vec,
+                    spare_vec,
+                    state,
+                    *plain,
+                );
+            }
+        }
+    }
+}
+
 const BUILD_PHASE_TRAINING: i64 = 0;
-const BUILD_PHASE_BUILDING_GRAPH: i64 = 1;
-const BUILD_PHASE_FINALIZING_GRAPH: i64 = 2;
+const BUILD_PHASE_COLLECTING_VECTORS: i64 = 1;
+const BUILD_PHASE_CLUSTERING: i64 = 2;
+const BUILD_PHASE_BUILDING_CLUSTER: i64 = 3;
+const BUILD_PHASE_BUILDING_GRAPH: i64 = 4;
+const BUILD_PHASE_FINALIZING_GRAPH: i64 = 5;
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn ambuildphasename(phasenum: i64) -> *mut ffi::c_char {
     match phasenum {
+        BUILD_PHASE_COLLECTING_VECTORS => "collecting vectors".as_pg_cstr(),
+        BUILD_PHASE_CLUSTERING => "k-means clustering".as_pg_cstr(),
+        BUILD_PHASE_BUILDING_CLUSTER => "building cluster index".as_pg_cstr(),
         BUILD_PHASE_TRAINING => "training quantizer".as_pg_cstr(),
         BUILD_PHASE_BUILDING_GRAPH => "building graph".as_pg_cstr(),
         BUILD_PHASE_FINALIZING_GRAPH => "finalizing graph".as_pg_cstr(),

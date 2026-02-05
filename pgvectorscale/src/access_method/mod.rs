@@ -7,6 +7,7 @@ mod debugging;
 pub mod distance;
 mod graph;
 pub mod guc;
+mod k_means;
 mod labels;
 mod meta_page;
 mod node;

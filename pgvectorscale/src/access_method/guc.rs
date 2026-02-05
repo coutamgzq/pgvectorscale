@@ -6,6 +6,7 @@ pub static TSV_PARALLEL_FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new
 pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
+pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -108,6 +109,23 @@ pub fn init() {
         -1,
         1024,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.num_clusters".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Number of clusters for k-means clustering during index build".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When set to > 1, uses k-means to partition vectors into clusters and builds separate indexes for each cluster. Set to 1 for standard single-index build.".as_pg_cstr())
+        },
+        &TSV_NUM_CLUSTERS,
+        1,
+        64,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }
