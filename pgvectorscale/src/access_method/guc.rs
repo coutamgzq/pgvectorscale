@@ -7,6 +7,8 @@ pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting:
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
 pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static TSV_CLUSTERING_MAX_SAMPLE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100000);
+pub static TSV_CLUSTERING_SAMPLE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000000);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -125,6 +127,40 @@ pub fn init() {
         &TSV_NUM_CLUSTERS,
         1,
         64,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.clustering_max_sample_size".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Maximum number of vectors to sample for k-means clustering".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When the table size exceeds diskann.clustering_sample_threshold, only this many vectors will be sampled for k-means clustering. Set to 0 to disable sampling and use all vectors.".as_pg_cstr())
+        },
+        &TSV_CLUSTERING_MAX_SAMPLE_SIZE,
+        0,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.clustering_sample_threshold".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Threshold for enabling sampling during k-means clustering".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When the table size exceeds this threshold, sampling will be enabled for k-means clustering. Set to 0 to always enable sampling.".as_pg_cstr())
+        },
+        &TSV_CLUSTERING_SAMPLE_THRESHOLD,
+        0,
+        i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );

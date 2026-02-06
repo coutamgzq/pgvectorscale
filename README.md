@@ -166,7 +166,7 @@ To enable pgvectorscale:
 1. Create a StreamingDiskANN index on the embedding column:
     ```postgresql
     CREATE INDEX document_embedding_idx ON document_embedding
-    USING diskann (embedding vector_cosine_ops);
+    USING diskann (embedding);
     ```
 1. Find the 10 closest embeddings using the index.
 
