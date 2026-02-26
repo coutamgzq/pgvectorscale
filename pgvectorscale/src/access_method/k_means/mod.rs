@@ -5,6 +5,25 @@ pub mod quick_centers;
 use kmeans1d::kmeans1d;
 use lloyd::LloydKMeans;
 
+/// k-means 聚类主函数
+/// 
+/// 该函数实现了 k-means 聚类算法，用于将向量数据分成 k 个聚类
+/// 
+/// 算法选择策略:
+/// - 如果 is_spherical 为 true，先对向量进行 L2 归一化 (用于球面 k-means)
+/// - 如果样本数量 n <= 聚类数 c，使用 quick_centers (每个样本作为一个中心)
+/// - 如果维度 dims == 1，使用一维 k-means (kmeans1d)
+/// - 否则使用标准的 Lloyd 算法 (多轮迭代直到收敛)
+/// 
+/// 参数说明:
+/// - c: 聚类数量
+/// - samples: 待聚类的向量集合，每个向量为 f32 数组
+/// - is_spherical: 是否使用球面 k-means (先归一化)
+/// - iterations: 最大迭代次数
+/// - prefer_kmeanspp: 是否使用 k-means++ 初始化 (更好的初始中心点选择)
+/// 
+/// 返回值:
+/// - Vec<Vec<f32>>: 聚类中心点坐标
 pub fn k_means(
     c: usize,
     mut samples: Vec<Vec<f32>>,
@@ -47,6 +66,21 @@ pub fn k_means(
     lloyd_k_means.finish()
 }
 
+/// 根据聚类中心点查找向量所属的聚类
+/// 
+/// 该函数计算输入向量与所有聚类中心点的距离，返回最近中心的索引
+/// 
+/// 实现原理:
+/// - 遍历所有中心点，计算输入向量与每个中心的欧氏距离 (squared_distance)
+/// - 使用平方距离避免开方运算，提高性能
+/// - 返回距离最小的中心点索引
+/// 
+/// 参数说明:
+/// - vector: 输入向量
+/// - centroids: 聚类中心点集合
+/// 
+/// 返回值:
+/// - usize: 最近的中心点索引 (即该向量所属的聚类 ID)
 pub fn k_means_lookup(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
     assert!(!centroids.is_empty());
     let mut result = (f32::INFINITY, 0);

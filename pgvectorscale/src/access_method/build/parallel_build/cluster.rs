@@ -1,5 +1,23 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// 聚类构建模块 - 实现基于 k-means 聚类的并行索引构建
+/// 
+/// 本模块实现了 pgvectorscale 扩展的聚类构建功能，主要包含:
+/// 1. VectorCollector: 收集向量用于聚类分析
+/// 2. ClusterParallelData: 存储聚类中心点的并行共享数据结构
+/// 3. perform_clustering: 执行 k-means 聚类算法
+/// 4. collect_vectors_for_clustering: 从堆表收集向量
+/// 5. build_index_with_clustering: 聚类构建的主入口函数
+/// 6. do_parallel_cluster_build: 并行聚类构建
+/// 
+/// 聚类构建的目的:
+/// - 将大规模向量数据分成多个聚类，减少每个子图的规模
+/// - 在顺序构建模式下，可以按聚类依次构建子图，每批只加载目标聚类的向量
+/// - 减少内存占用和构建时间
+/// 
+/// 注意事项:
+/// - 并行构建模式下，聚类信息主要用于共享中心点，每个 worker 仍然处理全部向量
+/// - 顺序构建模式下，可以利用聚类信息进行过滤，只处理目标聚类的向量
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{pgstat_progress_update_param};
 use pgrx::*;
@@ -98,7 +116,26 @@ impl ClusterParallelData {
 
 
 
-/// Performs k-means clustering on collected vectors and returns centroids and cluster assignments
+/// 执行 k-means 聚类算法
+/// 
+/// 该函数对输入的向量集合进行聚类，返回聚类中心点和每个向量的聚类分配
+/// 
+/// 算法流程:
+/// 1. 更新进度状态为 BUILD_PHASE_CLUSTERING
+/// 2. 确定实际聚类数量: actual_num_clusters = min(num_clusters, vectors.len())
+///    - 如果向量数量少于请求的聚类数，使用向量数量作为聚类数
+/// 3. 调用 k_means::k_means 执行 k-means 算法:
+///    - c: 聚类数量
+///    - vectors: 输入向量
+///    - is_spherical: false (不使用球面 k-means)
+///    - iterations: 100 (最大迭代次数)
+///    - prefer_kmeanspp: true (使用 k-means++ 初始化)
+/// 4. 对每个向量，调用 k_means::k_means_lookup 找到最近的中心点
+/// 5. 统计每个聚类的向量数量
+/// 
+/// 返回值:
+/// - Vec<Vec<f32>>: 聚类中心点坐标，每个 Vec 表示一个中心点
+/// - Vec<usize>: 每个向量对应的聚类 ID
 pub fn perform_clustering(
     vectors: Vec<Vec<f32>>,
     num_clusters: usize,
@@ -212,7 +249,39 @@ pub fn sample_vectors_if_needed(
     }
 }
 
-/// Main entry point for cluster-based index build
+/// 聚类构建主入口函数
+/// 
+/// 该函数是使用聚类进行索引构建的入口点，实现了以下功能:
+/// 
+/// 1. 向量收集阶段 (collect_vectors_for_clustering):
+///    - 扫描堆表，收集所有向量数据
+///    - 可选的采样机制，根据 max_sample_size 和 sample_threshold 决定是否采样
+///    - 采样可以减少 k-means 聚类的计算量
+/// 
+/// 2. 聚类阶段 (perform_clustering):
+///    - 对收集的向量执行 k-means 聚类
+///    - 返回聚类中心点 (centroids) 和每个向量的聚类分配 (cluster_assignments)
+/// 
+/// 3. 量化器训练 (maybe_train_quantizer):
+///    - 如果使用 SBQ 压缩存储，需要训练量化器
+///    - 使用全部向量进行训练
+/// 
+/// 4. 构建阶段:
+///    - 根据 worker 数量决定并行或顺序构建
+///    - 并行模式: do_parallel_cluster_build
+///    - 顺序模式: do_heap_scan_with_clustering (带聚类过滤)
+/// 
+/// 参数说明:
+/// - heaprel: 堆表 Relation
+/// - indexrel: 索引 Relation
+/// - index_info: 索引信息
+/// - meta_page: 元页面
+/// - num_clusters: 请求的聚类数量
+/// - heap_relation: 堆表 PgRelation
+/// - index_relation: 索引 PgRelation
+/// 
+/// 返回值:
+/// - IndexBuildResult: 包含处理的元组数
 pub fn build_index_with_clustering(
     heaprel: pg_sys::Relation,
     indexrel: pg_sys::Relation,
@@ -524,7 +593,46 @@ unsafe extern "C-unwind" fn build_callback_collect_vectors(
     }
 }
 
-/// Parallel worker entry point for cluster build
+/// 并行构建 Worker 入口函数 - 聚类版本
+/// 
+/// 这是 PostgreSQL 并行索引构建的 worker 入口函数，由主进程启动的并行 workers 执行
+/// 
+/// 执行流程详解:
+/// 
+/// 1. 初始化检查
+///    - 检查进程状态标志，确保在安全的索引创建状态下
+/// 
+/// 2. 从共享内存获取数据
+///    - ParallelShared: 包含构建参数和共享状态
+///    - ClusterParallelData: 包含聚类中心点信息
+///    - ParallelTableScanDescData: 并行表扫描描述符
+/// 
+/// 3. 初始化同步 (关键!)
+///    - 使用 compare_exchange 尝试将 start_nodes_initialized 从 false 改为 true
+///    - 成功的 worker 成为"初始化 worker"，负责构建起始节点
+///    - 失败的 workers 进入等待循环:
+///      - 等待 ntuples >= 1024 (初始节点数阈值) 或 初始化完成
+///      - 使用 ConditionVariableSleep 休眠，节省 CPU
+/// 
+/// 4. 打开关系 (Relation)
+///    - 根据 is_concurrent 选择锁模式:
+///      - 并发索引: heap=ShareLock, index=AccessExclusiveLock
+///      - 非并发: heap=ShareUpdateExclusiveLock, index=RowExclusiveLock
+///    - 打开堆表和索引表
+/// 
+/// 5. 获取聚类中心点
+///    - 从 ClusterParallelData 读取 centroids (共享内存)
+///    - 这些中心点是在主进程聚类阶段计算好的
+/// 
+/// 6. 执行构建
+///    - 调用 do_heap_scan_with_clustering
+///    - 关键: 传入空的 heap_tids 和 cluster_assignments
+///      (因为并行模式下无法高效地按聚类过滤)
+///    - 所有 workers 处理全部数据，但使用相同的起始节点
+/// 
+/// 7. 清理资源
+///    - 关闭索引和堆表
+///    - 释放锁
 #[pg_guard]
 #[unsafe(no_mangle)]
 #[cfg(feature = "build_parallel")]

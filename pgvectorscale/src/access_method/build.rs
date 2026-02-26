@@ -332,6 +332,26 @@ fn get_meta_page(
 }
 
 #[pg_guard]
+/// PostgreSQL 索引访问方法的主构建函数
+/// 
+/// 这是 pgvectorscale 扩展的入口点，当执行 CREATE INDEX 时由 PostgreSQL 调用
+/// 
+/// 参数:
+/// - heaprel: 堆表 Relation，用于读取原始数据
+/// - indexrel: 索引 Relation，用于写入索引数据
+/// - index_info: 索引信息结构，包含索引元数据
+/// 
+/// 构建流程:
+/// 1. 初始化元页面 (MetaPage) - 存储索引配置信息
+/// 2. 判断是否使用聚类 (clustering) - 根据 TSV_NUM_CLUSTERS 配置
+/// 3. 如果使用聚类: 调用 cluster::build_index_with_clustering 进行聚类+构建
+/// 4. 如果不使用聚类:
+///    - 训练量化器 (如果是 SBQ 压缩存储)
+///    - 判断是否使用并行构建 (基于 worker 数量和向量数量)
+///    - 执行并行或顺序的 heap scan + 图构建
+/// 
+/// 返回值:
+/// - IndexBuildResult: 包含处理的堆元组数和索引元组数
 pub extern "C-unwind" fn ambuild(
     heaprel: pg_sys::Relation,
     indexrel: pg_sys::Relation,
@@ -397,10 +417,26 @@ pub extern "C-unwind" fn ambuild(
             0
         };
     let is_concurrent = unsafe { (*index_info).ii_Concurrent };
+    
+    /// 并行构建数据结构，包含并行上下文和快照
     struct ParallelData {
         pcxt: *mut pg_sys::ParallelContext,
         snapshot: *mut pg_sys::SnapshotData,
     }
+    
+    /// 并行构建初始化逻辑:
+    /// 1. 进入并行模式 (EnterParallelMode)
+    /// 2. 创建并行上下文 (CreateParallelContext)，指定 worker 数量
+    /// 3. 注册事务快照 (用于并发索引构建)
+    /// 4. 估算共享内存需求并分配:
+    ///    - ParallelShared: 共享状态 (元组计数、初始化状态等)
+    ///    - ParallelTableScanDescData: 并行表扫描描述符
+    /// 5. 初始化共享状态:
+    ///    - 设置参数 (heaprelid, indexrelid, worker_count 等)
+    ///    - 初始化原子计数器 (ntuples, start_nodes_initialized 等)
+    ///    - 初始化条件变量用于 worker 同步
+    /// 6. 启动并行 workers (LaunchParallelWorkers)
+    /// 7. 等待 workers 附着 (WaitForParallelWorkersToAttach)
     let parallel_data = if workers > 0 {
         notice!("Parallel build with {} workers", workers);
         unsafe {
@@ -798,6 +834,36 @@ fn do_heap_scan(
     )
 }
 
+/// 执行堆表扫描并进行聚类过滤的图构建
+/// 
+/// 这是构建 DiskANN 图索引的核心函数，支持顺序和并行两种模式
+/// 
+/// 参数说明:
+/// - index_info: 索引信息
+/// - heap_relation: 堆表 Relation
+/// - index_relation: 索引 Relation  
+/// - meta_page: 元页面，存储索引配置
+/// - write_stats: 写入统计信息
+/// - parallel_build_info: 并行构建信息 (如果使用并行构建)
+/// - worker_count: worker 数量
+/// - heap_tids: 聚类时采样向量对应的堆表元组指针
+/// - cluster_assignments: 每个采样向量的聚类分配 (用于过滤)
+/// - centroids: 聚类中心点坐标
+/// - num_clusters: 聚类数量
+/// 
+/// 执行流程:
+/// 1. 判断是否使用聚类 (use_clustering = num_clusters > 0 && !centroids.is_empty())
+/// 2. 根据是否有 parallel_build_info 选择并行或顺序执行:
+///    - 并行模式: 使用 IndexBuildHeapScanParallel
+///    - 顺序模式: 使用 pg_sys::IndexBuildHeapScan
+/// 3. 根据存储类型 (Plain/SbqCompression) 选择对应的存储实现
+/// 4. 如果使用聚类，传入 ClusterFilterContext 用于过滤非目标聚类的向量
+/// 5. 执行完成后调用 finalize 函数完成构建
+/// 
+/// 聚类过滤原理 (仅顺序模式有效):
+/// - 通过 heap_tids 匹配当前处理的元组
+/// - 找到对应索引后，用 cluster_assignments 判断是否属于目标 cluster_id
+/// - 如果不属于则跳过该元组
 fn do_heap_scan_with_clustering(
     index_info: *mut pg_sys::IndexInfo,
     heap_relation: &PgRelation,
@@ -1163,6 +1229,23 @@ unsafe extern "C-unwind" fn build_callback(
     }
 }
 
+/// 并行构建回调函数 (PostgreSQL 索引扫描回调)
+/// 
+/// 这是 PostgreSQL 并行索引扫描时调用的回调函数，处理每个堆元组
+/// 
+/// 执行流程:
+/// 1. 从 ctid (元组指针) 获取 heap_pointer
+/// 2. 获取 index_relation 用于后续操作
+/// 3. 从 state 中提取 StorageBuildStateParallel (包含存储和构建状态)
+/// 4. 根据存储类型 (SbqSpeedup/Plain) 解析向量数据
+/// 5. 创建向量的克隆 (spare_vec) 用于并行处理
+/// 6. 调用 build_callback_parallel_memory_wrapper 执行实际的构建逻辑
+/// 
+/// 并行构建与顺序构建的关键区别:
+/// - 使用 BuildStateParallel 替代 BuildState
+/// - 需要处理共享状态的同步 (ntuples 原子计数)
+/// - 需要处理初始化同步 (start_nodes_initialized)
+/// - 可能需要定期刷新邻居缓存 (maybe_flush_neighbor_cache)
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_parallel(
     index: pg_sys::Relation,
@@ -1278,6 +1361,28 @@ unsafe fn build_callback_parallel_memory_wrapper<S: Storage>(
     state.memcxt.reset();
 }
 
+/// 并行构建内部处理函数
+/// 
+/// 这是并行构建的核心逻辑，处理单个向量的插入
+/// 
+/// 执行步骤:
+/// 1. check_for_interrupts!(): 检查是否需要处理中断 (如 Ctrl+C)
+/// 2. increment_ntuples(): 增加本地和共享的元组计数
+///    - 对于初始化 worker，需要特殊处理前 1024 个节点
+///    - 达到阈值后通知其他等待的 workers
+/// 3. 距离预处理:
+///    - 如果是 Cosine 距离，对向量进行归一化
+///    - 其他距离类型直接使用原始向量
+/// 4. 创建节点: storage.create_node() 在存储中创建向量节点
+/// 5. 图插入: graph.insert() 将节点插入到图中，建立邻居关系
+/// 6. 缓存刷新: 根据 flush_interval 定期刷新邻居缓存
+///    - 避免内存过大
+///    - 将本地缓存写入共享存储
+/// 
+/// 并行构建的特殊处理:
+/// - 使用 local_stats 替代全局 stats
+/// - 使用 local_ntuples 跟踪本地处理的元组数
+/// - 需要定期调用 maybe_flush_neighbor_cache 同步状态
 #[inline(always)]
 fn build_callback_parallel_internal<S: Storage>(
     index: &PgRelation,
@@ -1527,6 +1632,23 @@ fn build_index_for_cluster(
     }
 }
 
+/// 顺序构建模式下带聚类过滤的回调函数
+/// 
+/// 该回调在顺序构建 + 聚类模式下使用，用于过滤非目标聚类的向量
+/// 
+/// 过滤逻辑:
+/// 1. 从 state 中提取 ClusterFilterContext (包含聚类信息)
+/// 2. 使用 heap_pointer 在 heap_tids 中查找当前元组的索引位置
+/// 3. 如果找到匹配:
+///    - 检查 cluster_assignments[idx] 是否等于目标 cluster_id
+///    - 如果不等，则提前返回 (跳过该元组)
+/// 4. 如果未找到匹配 (可能是未采样的向量)，默认处理 (不做过滤)
+/// 5. 对于通过的元组，调用标准的 build_callback_memory_wrapper
+/// 
+/// 聚类过滤的优势:
+/// - 可以按聚类依次构建，每次只处理一个聚类的向量
+/// - 减少内存占用，因为每个时刻只需要加载一个聚类的数据
+/// - 便于实现增量构建
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_cluster(
     index: pg_sys::Relation,
@@ -1576,6 +1698,24 @@ unsafe extern "C-unwind" fn build_callback_cluster(
     }
 }
 
+/// 并行构建 + 聚类模式的回调函数
+/// 
+/// 该函数在并行构建且启用聚类时使用
+/// 
+/// 重要特性:
+/// - 在并行模式下，cluster_assignments 只覆盖采样向量，无法用于完整过滤
+/// - 因此并行模式下传入空的 heap_tids 和 cluster_assignments
+/// - 该回调实际上不会执行真正的聚类过滤
+/// - 但保留此回调是为了代码结构一致性
+/// 
+/// 执行流程:
+/// 1. 提取 ClusterFilterContext (包含聚类信息)
+/// 2. 尝试在 heap_tids 中查找当前元组 (并行模式下总是失败，返回 None)
+/// 3. 如果找到匹配且聚类 ID 不匹配，则跳过
+/// 4. 否则调用标准的并行处理逻辑
+/// 
+/// 注意: 并行模式下 heap_tids 为空，所以步骤 2 总是返回 None
+///      这意味着所有向量都会被处理，不进行过滤
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_parallel_cluster(
     index: pg_sys::Relation,
