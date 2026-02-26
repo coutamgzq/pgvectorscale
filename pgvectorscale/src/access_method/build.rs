@@ -1151,13 +1151,13 @@ unsafe extern "C-unwind" fn build_callback(
         StorageBuildState::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, bq);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
             }
         }
         StorageBuildState::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, plain);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
             }
         }
     }
@@ -1187,7 +1187,7 @@ unsafe extern "C-unwind" fn build_callback_parallel(
                     vec,
                     spare_vec,
                     state,
-                    bq,
+                    *bq,
                 );
             }
         }
@@ -1202,7 +1202,7 @@ unsafe extern "C-unwind" fn build_callback_parallel(
                     vec,
                     spare_vec,
                     state,
-                    plain,
+                    *plain,
                 );
             }
         }
@@ -1564,13 +1564,13 @@ unsafe extern "C-unwind" fn build_callback_cluster(
         ClusterFilterState::SbqSpeedup(bq, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, bq);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
             }
         }
         ClusterFilterState::Plain(plain, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, plain);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
             }
         }
     }
@@ -1621,7 +1621,7 @@ unsafe extern "C-unwind" fn build_callback_parallel_cluster(
                     vec,
                     spare_vec,
                     state,
-                    bq,
+                    *bq,
                 );
             }
         }
@@ -1636,7 +1636,7 @@ unsafe extern "C-unwind" fn build_callback_parallel_cluster(
                     vec,
                     spare_vec,
                     state,
-                    plain,
+                    *plain,
                 );
             }
         }

@@ -333,7 +333,7 @@ fn do_parallel_cluster_build(
     workers: usize,
     is_concurrent: bool,
     centroids: &[Vec<f32>],
-    _cluster_assignments: &[usize],
+    cluster_assignments: &[usize],
     write_stats: WriteStats,
 ) -> usize {
     notice!("Parallel build with {} workers for {} clusters", workers, centroids.len());
