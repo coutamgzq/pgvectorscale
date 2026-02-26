@@ -12,7 +12,7 @@ use crate::access_method::storage::StorageType;
 use crate::util::ports::PROGRESS_CREATE_IDX_SUBPHASE;
 
 use super::super::{
-    ParallelShared, ParallelSharedParams, ParallelBuildState,
+    ParallelShared, ParallelSharedParams, ParallelBuildState, ParallelBuildInfo,
     BUILD_PHASE_COLLECTING_VECTORS, BUILD_PHASE_CLUSTERING, BUILD_PHASE_BUILDING_GRAPH,
 };
 use super::super::parallel;
@@ -36,13 +36,64 @@ pub struct VectorCollectorWithMeta<'a> {
 }
 
 /// Cluster data for parallel builds
-#[derive(Debug)]
+/// Note: This structure is stored in shared memory, so we use fixed-size arrays
+/// instead of Vec to ensure data is actually stored in shared memory.
+/// centroids_data: flattened centroids (all centroids concatenated)
+/// centroids_dimensions: dimension of each centroid vector
+/// centroids_count: number of centroids
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(feature = "build_parallel"), allow(dead_code))]
+#[repr(C)]
 pub struct ClusterParallelData {
-    pub pcxt: *mut pg_sys::ParallelContext,
-    pub snapshot: *mut pg_sys::SnapshotData,
-    pub centroids: Vec<Vec<f32>>,
-    pub cluster_assignments: Vec<usize>,
+    pub centroids_count: usize,
+    pub centroids_dimensions: usize,
+    // Flexible array member - centroids follow this struct in memory
+}
+
+impl ClusterParallelData {
+    /// Calculate the size needed for ClusterParallelData with given centroids
+    pub fn size_needed(num_centroids: usize, dimensions: usize) -> usize {
+        // Use proper alignment for f32 data
+        let header_size = std::mem::size_of::<ClusterParallelData>();
+        let data_size = num_centroids * dimensions * std::mem::size_of::<f32>();
+        // Align to 8 bytes for safety
+        let aligned_header = (header_size + 7) & !7;
+        aligned_header + data_size
+    }
+    
+    /// Get pointer to centroids data (after the header, properly aligned)
+    unsafe fn centroids_data_ptr(ptr: *const Self) -> *const f32 {
+        let header_size = std::mem::size_of::<ClusterParallelData>();
+        let aligned_offset = (header_size + 7) & !7;
+        (ptr as *const u8).add(aligned_offset) as *const f32
+    }
+    
+    /// Write centroids data after the struct in memory
+    pub unsafe fn write_centroids(&self, ptr: *mut Self, centroids: &[Vec<f32>]) {
+        let data_ptr = Self::centroids_data_ptr(ptr) as *mut f32;
+        for (i, centroid) in centroids.iter().enumerate() {
+            let dest = data_ptr.add(i * self.centroids_dimensions);
+            std::ptr::copy_nonoverlapping(centroid.as_ptr(), dest, self.centroids_dimensions);
+        }
+    }
+    
+    /// Read centroids from the memory area after this struct
+    pub unsafe fn read_centroids(&self) -> Vec<Vec<f32>> {
+        // Validate values to prevent overflow
+        if self.centroids_count == 0 || self.centroids_dimensions == 0 {
+            return Vec::new();
+        }
+        
+        let data_ptr = Self::centroids_data_ptr(self);
+        let mut centroids = Vec::with_capacity(self.centroids_count);
+        for i in 0..self.centroids_count {
+            let src = data_ptr.add(i * self.centroids_dimensions);
+            let mut centroid = vec![0.0f32; self.centroids_dimensions];
+            std::ptr::copy_nonoverlapping(src, centroid.as_mut_ptr(), self.centroids_dimensions);
+            centroids.push(centroid);
+        }
+        centroids
+    }
 }
 
 
@@ -255,9 +306,9 @@ pub fn build_index_with_clustering(
             write_stats,
             None,
             workers,
-            &heap_tids_for_clustering,
-            &cluster_assignments,
-            &centroids,
+            heap_tids_for_clustering.as_slice(),
+            cluster_assignments.as_slice(),
+            centroids.as_slice(),
             actual_num_clusters,
         )
     };
@@ -270,6 +321,8 @@ pub fn build_index_with_clustering(
 }
 
 /// Performs parallel cluster build
+/// Note: cluster_assignments is not used in parallel builds because each worker
+/// processes all vectors (no cluster filtering is applied in parallel mode).
 fn do_parallel_cluster_build(
     heaprel: pg_sys::Relation,
     _indexrel: pg_sys::Relation,
@@ -280,7 +333,7 @@ fn do_parallel_cluster_build(
     workers: usize,
     is_concurrent: bool,
     centroids: &[Vec<f32>],
-    cluster_assignments: &[usize],
+    _cluster_assignments: &[usize],
     write_stats: WriteStats,
 ) -> usize {
     notice!("Parallel build with {} workers for {} clusters", workers, centroids.len());
@@ -300,7 +353,29 @@ fn do_parallel_cluster_build(
         };
 
         parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ParallelShared>());
-        parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ClusterParallelData>());
+        // Calculate size needed for ClusterParallelData with centroids
+        let centroids_count = centroids.len();
+        let centroids_dimensions = centroids.first().map_or(0, |c| c.len());
+        // Validate dimensions
+        if centroids_count > 0 && centroids_dimensions == 0 {
+            warning!("Centroids have zero dimensions, falling back to sequential build");
+            parallel::cleanup_parallel_context(pcxt, snapshot);
+            return super::super::do_heap_scan_with_clustering(
+                index_info,
+                heap_relation,
+                index_relation,
+                meta_page,
+                write_stats,
+                None,
+                workers,
+                &[],
+                cluster_assignments,
+                centroids,
+                centroids.len(),
+            );
+        }
+        let cluster_data_size = ClusterParallelData::size_needed(centroids_count, centroids_dimensions);
+        parallel::toc_estimate_single_chunk(pcxt, cluster_data_size);
         let tablescandesc_size_estimate =
             pg_sys::table_parallelscan_estimate(heaprel, snapshot);
         parallel::toc_estimate_single_chunk(pcxt, tablescandesc_size_estimate);
@@ -348,17 +423,18 @@ fn do_parallel_cluster_build(
         );
 
         let cluster_data =
-            pg_sys::shm_toc_allocate((*pcxt).toc, std::mem::size_of::<ClusterParallelData>())
+            pg_sys::shm_toc_allocate((*pcxt).toc, cluster_data_size)
                 .cast::<ClusterParallelData>();
 
         let cluster_parallel_data = ClusterParallelData {
-            pcxt: std::ptr::null_mut(),
-            snapshot: std::ptr::null_mut(),
-            centroids: centroids.to_vec(),
-            cluster_assignments: cluster_assignments.to_vec(),
+            centroids_count,
+            centroids_dimensions,
         };
 
+        // Write the header
         cluster_data.write(cluster_parallel_data);
+        // Write the centroids data after the header
+        cluster_parallel_data.write_centroids(cluster_data, centroids);
 
         let tablescandesc =
             pg_sys::shm_toc_allocate((*pcxt).toc, tablescandesc_size_estimate)
@@ -530,10 +606,12 @@ pub extern "C-unwind" fn _vectorscale_build_cluster_main(
     let index_relation = unsafe { PgRelation::from_pg(indexrel) };
     let mut meta_page = MetaPage::fetch(&index_relation);
 
-    let centroids = unsafe { (*cluster_data).centroids.clone() };
-    let cluster_assignments = unsafe { (*cluster_data).cluster_assignments.clone() };
+    let centroids = unsafe { (*cluster_data).read_centroids() };
     let num_clusters = centroids.len();
 
+    // In parallel build with clustering, we can't use heap_tids for filtering
+    // because cluster_assignments only contains assignments for sampled vectors.
+    // Instead, we pass empty arrays and disable cluster filtering in the callback.
     super::super::do_heap_scan_with_clustering(
         index_info,
         &heap_relation,
@@ -547,7 +625,7 @@ pub extern "C-unwind" fn _vectorscale_build_cluster_main(
         }),
         params.worker_count,
         &[],
-        &cluster_assignments,
+        &[],
         &centroids,
         num_clusters,
     );

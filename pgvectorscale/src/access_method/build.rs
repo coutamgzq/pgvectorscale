@@ -847,17 +847,41 @@ fn do_heap_scan_with_clustering(
                     shared_state,
                     parallel_info.is_initializing_worker,
                 );
-                let mut state = StorageBuildStateParallel::Plain(&mut plain, &mut bs);
 
-                unsafe {
-                    IndexBuildHeapScanParallel(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback_parallel),
-                        &mut state,
-                        parallel_info.tablescandesc,
-                    );
+                if use_clustering {
+                    // For parallel build with clustering, we use a filter context that
+                    // accepts all vectors since we can't efficiently filter by cluster
+                    // in parallel mode (cluster_assignments only covers sampled vectors)
+                    let filter_context = ClusterFilterContext {
+                        heap_tids: &[],
+                        cluster_assignments: &[],
+                        cluster_id: 0,
+                    };
+                    let mut filter_state = ClusterFilterStateParallel::Plain(&mut plain, &mut bs, &filter_context);
+
+                    unsafe {
+                        IndexBuildHeapScanParallel(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_parallel_cluster),
+                            &mut filter_state,
+                            parallel_info.tablescandesc,
+                        );
+                    }
+                } else {
+                    let mut state = StorageBuildStateParallel::Plain(&mut plain, &mut bs);
+
+                    unsafe {
+                        IndexBuildHeapScanParallel(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_parallel),
+                            &mut state,
+                            parallel_info.tablescandesc,
+                        );
+                    }
                 }
 
                 finalize_remaining_parallel_nodes(&mut plain, bs, index_relation, write_stats)
@@ -880,17 +904,41 @@ fn do_heap_scan_with_clustering(
                     shared_state,
                     parallel_info.is_initializing_worker,
                 );
-                let mut state = StorageBuildStateParallel::SbqSpeedup(&mut bq, &mut bs);
 
-                unsafe {
-                    IndexBuildHeapScanParallel(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback_parallel),
-                        &mut state,
-                        parallel_info.tablescandesc,
-                    );
+                if use_clustering {
+                    // For parallel build with clustering, we use a filter context that
+                    // accepts all vectors since we can't efficiently filter by cluster
+                    // in parallel mode (cluster_assignments only covers sampled vectors)
+                    let filter_context = ClusterFilterContext {
+                        heap_tids: &[],
+                        cluster_assignments: &[],
+                        cluster_id: 0,
+                    };
+                    let mut filter_state = ClusterFilterStateParallel::SbqSpeedup(&mut bq, &mut bs, &filter_context);
+
+                    unsafe {
+                        IndexBuildHeapScanParallel(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_parallel_cluster),
+                            &mut filter_state,
+                            parallel_info.tablescandesc,
+                        );
+                    }
+                } else {
+                    let mut state = StorageBuildStateParallel::SbqSpeedup(&mut bq, &mut bs);
+
+                    unsafe {
+                        IndexBuildHeapScanParallel(
+                            heap_relation.as_ptr(),
+                            index_relation.as_ptr(),
+                            index_info,
+                            Some(build_callback_parallel),
+                            &mut state,
+                            parallel_info.tablescandesc,
+                        );
+                    }
                 }
 
                 finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
@@ -1103,13 +1151,13 @@ unsafe extern "C-unwind" fn build_callback(
         StorageBuildState::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, bq);
             }
         }
         StorageBuildState::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, plain);
             }
         }
     }
@@ -1131,32 +1179,30 @@ unsafe extern "C-unwind" fn build_callback_parallel(
         StorageBuildStateParallel::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
+                // spare_vec is a clone of vec for the parallel build callback
+                let spare_vec = vec.clone();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
                     spare_vec,
                     state,
-                    *bq,
+                    bq,
                 );
             }
         }
         StorageBuildStateParallel::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
+                // spare_vec is a clone of vec for the parallel build callback
+                let spare_vec = vec.clone();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
                     spare_vec,
                     state,
-                    *plain,
+                    plain,
                 );
             }
         }
@@ -1363,7 +1409,6 @@ fn build_index_for_cluster(
                     shared_state,
                     parallel_info.is_initializing_worker,
                 );
-                let _state = StorageBuildStateParallel::Plain(&mut plain, &mut bs);
                 let mut filter_state = ClusterFilterStateParallel::Plain(&mut plain, &mut bs, &filter_context);
 
                 unsafe {
@@ -1397,7 +1442,6 @@ fn build_index_for_cluster(
                     shared_state,
                     parallel_info.is_initializing_worker,
                 );
-                let _state = StorageBuildStateParallel::SbqSpeedup(&mut bq, &mut bs);
                 let mut filter_state = ClusterFilterStateParallel::SbqSpeedup(&mut bq, &mut bs, &filter_context);
 
                 unsafe {
@@ -1439,7 +1483,6 @@ fn build_index_for_cluster(
                 );
                 let page_type = PlainStorage::page_type();
                 let mut bs = BuildState::new(index_relation, graph, page_type);
-                let _state = StorageBuildState::Plain(&mut plain, &mut bs);
                 let mut filter_state = ClusterFilterState::Plain(&mut plain, &mut bs, &filter_context);
 
                 unsafe {
@@ -1466,7 +1509,6 @@ fn build_index_for_cluster(
 
                 let page_type = SbqSpeedupStorage::page_type();
                 let mut bs = BuildState::new(index_relation, graph, page_type);
-                let _state = StorageBuildState::SbqSpeedup(&mut bq, &mut bs);
                 let mut filter_state = ClusterFilterState::SbqSpeedup(&mut bq, &mut bs, &filter_context);
 
                 unsafe {
@@ -1522,13 +1564,13 @@ unsafe extern "C-unwind" fn build_callback_cluster(
         ClusterFilterState::SbqSpeedup(bq, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, bq);
             }
         }
         ClusterFilterState::Plain(plain, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, plain);
             }
         }
     }
@@ -1571,32 +1613,30 @@ unsafe extern "C-unwind" fn build_callback_parallel_cluster(
         ClusterFilterStateParallel::SbqSpeedup(bq, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
+                // spare_vec is a clone of vec for the parallel build callback
+                let spare_vec = vec.clone();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
                     spare_vec,
                     state,
-                    *bq,
+                    bq,
                 );
             }
         }
         ClusterFilterStateParallel::Plain(plain, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
+                // spare_vec is a clone of vec for the parallel build callback
+                let spare_vec = vec.clone();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
                     spare_vec,
                     state,
-                    *plain,
+                    plain,
                 );
             }
         }
