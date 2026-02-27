@@ -18,6 +18,7 @@ use crate::access_method::stats::WriteStats;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType};
 use crate::util::*;
+use std::collections::BTreeMap;
 
 const TSV_MAGIC_NUMBER: u32 = 768756476; //Magic number, random
 const TSV_VERSION: u32 = 3;
@@ -86,6 +87,7 @@ impl From<&MetaPageV1> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels: false,
+            cluster_start_nodes: BTreeMap::new(),
         }
     }
 }
@@ -157,6 +159,7 @@ impl From<MetaPageV2> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: meta.quantizer_metadata,
             has_labels: false,
+            cluster_start_nodes: BTreeMap::new(),
         }
     }
 }
@@ -207,6 +210,7 @@ pub struct MetaPage {
     quantizer_metadata: ItemPointer,
     /// Whether the index has labels
     has_labels: bool,
+    cluster_start_nodes: BTreeMap<u32, ItemPointer>,
 }
 
 impl MetaPage {
@@ -350,6 +354,7 @@ impl MetaPage {
             start_nodes: None,
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels,
+            cluster_start_nodes: BTreeMap::new(),
         };
 
         meta.store(index, true);
@@ -420,5 +425,25 @@ impl MetaPage {
 
     pub fn set_quantizer_metadata_pointer(&mut self, quantizer_pointer: IndexPointer) {
         self.quantizer_metadata = quantizer_pointer;
+    }
+
+    pub fn set_cluster_start_node(&mut self, cluster_id: u32, start_node: ItemPointer) {
+        self.cluster_start_nodes.insert(cluster_id, start_node);
+    }
+
+    pub fn get_cluster_start_node(&self, cluster_id: u32) -> Option<ItemPointer> {
+        self.cluster_start_nodes.get(&cluster_id).copied()
+    }
+
+    pub fn get_all_cluster_start_nodes(&self) -> &BTreeMap<u32, ItemPointer> {
+        &self.cluster_start_nodes
+    }
+
+    pub fn num_clusters(&self) -> usize {
+        if self.cluster_start_nodes.is_empty() {
+            1
+        } else {
+            self.cluster_start_nodes.len()
+        }
     }
 }
