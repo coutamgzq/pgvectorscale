@@ -12,7 +12,7 @@ use crate::access_method::storage::StorageType;
 use crate::util::ports::PROGRESS_CREATE_IDX_SUBPHASE;
 
 use super::super::{
-    ParallelShared, ParallelSharedParams, ParallelBuildState,
+    ParallelShared, ParallelSharedParams, ParallelBuildState, ParallelBuildInfo,
     BUILD_PHASE_COLLECTING_VECTORS, BUILD_PHASE_CLUSTERING, BUILD_PHASE_BUILDING_GRAPH,
 };
 use super::super::parallel;
