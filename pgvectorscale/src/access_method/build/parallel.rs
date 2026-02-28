@@ -122,20 +122,25 @@ pub struct ClusterQueues {
     pub num_queues: usize,
     pub queue_headers: [ClusterQueueHeader; 64],
     pub condition_vars: [ConditionVariable; 64],
+    pub entry_size: usize,    // Size of each entry
+    pub queue_capacity: usize, // Capacity of each queue
 }
 
 impl ClusterQueues {
-    pub fn new(num_queues: usize, queue_capacity: usize) -> Self {
+    pub fn new(num_queues: usize, queue_capacity: usize, num_dimensions: usize) -> Self {
+        let entry_size = std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>();
         let mut queues = Self {
             num_queues,
             queue_headers: unsafe { std::mem::zeroed() },
             condition_vars: unsafe { std::mem::zeroed() },
+            entry_size,
+            queue_capacity,
         };
 
         for i in 0..num_queues {
             queues.queue_headers[i] = ClusterQueueHeader::new(
                 queue_capacity,
-                std::mem::size_of::<ClusterQueueEntry>() + MAX_VECTOR_DIMENSIONS * std::mem::size_of::<f32>(),
+                entry_size,
             );
             unsafe {
                 pg_sys::ConditionVariableInit(&mut queues.condition_vars[i]);
@@ -144,16 +149,20 @@ impl ClusterQueues {
         queues
     }
 
-    pub fn get_queue(&self, cluster_id: usize) -> &ClusterQueueHeader {
-        &self.queue_headers[cluster_id]
+    /// Get pointer to queue data storage (immediately following this struct)
+    pub fn queue_data_ptr(&self) -> *mut u8 {
+        unsafe {
+            (self as *const Self as *mut u8).add(std::mem::size_of::<Self>())
+        }
     }
 
-    pub fn get_queue_mut(&mut self, cluster_id: usize) -> &mut ClusterQueueHeader {
-        &mut self.queue_headers[cluster_id]
-    }
-
-    pub fn get_cv(&self, cluster_id: usize) -> &ConditionVariable {
-        &self.condition_vars[cluster_id]
+    pub fn get_entry(&self, cluster_id: usize, index: usize) -> *mut ClusterQueueEntry {
+        unsafe {
+            self.queue_data_ptr()
+                .add(cluster_id * self.entry_size * self.queue_capacity)
+                .add(index * self.entry_size)
+                .cast::<ClusterQueueEntry>()
+        }
     }
 }
 
@@ -189,7 +198,12 @@ impl ClusterStartNodes {
 
     pub fn get_start_node(&self, cluster_id: usize) -> Option<pg_sys::ItemPointerData> {
         if cluster_id < self.num_clusters {
-            Some(self.nodes[cluster_id].start_node)
+            let start_node = self.nodes[cluster_id].start_node;
+            if start_node.ip_posid != 0 && start_node.ip_posid != pg_sys::InvalidOffsetNumber {
+                Some(start_node)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -199,11 +213,6 @@ impl ClusterStartNodes {
 pub fn calculate_queue_size(num_dimensions: usize, capacity: usize) -> usize {
     let entry_size = std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>();
     entry_size * capacity + std::mem::size_of::<ClusterQueueHeader>()
-}
-
-pub fn calculate_cluster_queues_size(num_clusters: usize, num_dimensions: usize, queue_capacity: usize) -> usize {
-    std::mem::size_of::<ClusterQueues>() + 
-        num_clusters * calculate_queue_size(num_dimensions, queue_capacity)
 }
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;

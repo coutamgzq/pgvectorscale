@@ -4,7 +4,7 @@ use std::time::Instant;
 use pg_sys::{FunctionCall0Coll, InvalidOid};
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{
-    index_getprocinfo, pgstat_progress_update_param, AsPgCStr, Oid,
+    index_getprocinfo, pgstat_progress_update_param, AsPgCStr,
 };
 use pgrx::*;
 
