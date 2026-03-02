@@ -122,11 +122,11 @@ pub fn init() {
             )
         },
         unsafe {
-            std::ffi::CStr::from_ptr("When set to > 1, uses k-means to partition vectors into clusters and builds separate indexes for each cluster. Set to 1 for standard single-index build.".as_pg_cstr())
+            std::ffi::CStr::from_ptr("When set to > 0, uses k-means to partition vectors into clusters and builds separate indexes for each cluster. Set to 1 for standard single-index build.".as_pg_cstr())
         },
         &TSV_NUM_CLUSTERS,
-        1,
-        64,
+        0,
+        1024,
         GucContext::Userset,
         GucFlags::default(),
     );

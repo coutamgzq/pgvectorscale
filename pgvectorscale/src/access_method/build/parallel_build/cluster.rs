@@ -9,6 +9,7 @@ use crate::access_method::meta_page::MetaPage;
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{WriteStats, InsertStats};
 use crate::access_method::storage::StorageType;
+use crate::access_method::labels::LabeledVector;
 use crate::util::ports::PROGRESS_CREATE_IDX_SUBPHASE;
 use crate::access_method::graph::Graph;
 use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
@@ -32,6 +33,22 @@ use super::super::parallel::{
 };
 
 const PARALLEL_BUILD_CLUSTER_CONSUMER_MAIN: *const c_char = c"_vectorscale_build_cluster_consumer_main".as_ptr();
+
+/// RAII guard to ensure ConditionVariableCancelSleep is called on drop.
+/// This is critical to prevent crashes during PostgreSQL's process cleanup.
+/// When a worker exits, shmem_exit() first releases DSM segments (including
+/// ClusterQueues), then calls on_shmem_exit callbacks including CleanupProcSignalState.
+/// If cv_sleep_target still points to a ConditionVariable in the released DSM,
+/// ConditionVariableCancelSleep() will access invalid memory.
+struct CvSleepGuard;
+
+impl Drop for CvSleepGuard {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::ConditionVariableCancelSleep();
+        }
+    }
+}
 
 pub struct VectorCollector {
     pub vectors: Vec<Vec<f32>>,
@@ -92,19 +109,29 @@ pub fn collect_vectors_for_clustering(
     index_info: *mut pg_sys::IndexInfo,
     meta_page: &MetaPage,
     max_sample_size: usize,
-    _sample_threshold: usize,
+    sample_threshold: usize,
 ) -> VectorCollector {
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_COLLECTING_VECTORS);
     }
 
+    // Determine sampling parameters upfront based on threshold
+    // We can't know the total number of vectors in advance, so we use the threshold
+    // to decide whether to use sampling. If sampling is needed, we'll adjust the
+    // interval dynamically as we collect vectors.
+    let use_sampling = max_sample_size > 0 && sample_threshold > 0;
+    
     let collector = VectorCollector {
         vectors: Vec::new(),
         heap_tids: Vec::new(),
         max_sample_size,
-        use_sampling: false,
+        use_sampling,
         total_vectors_seen: 0,
-        sample_interval: 1,
+        sample_interval: if use_sampling && sample_threshold > max_sample_size {
+            (sample_threshold as f64 / max_sample_size as f64).ceil() as usize
+        } else {
+            1
+        },
     };
 
     let mut collector_with_meta = VectorCollectorWithMeta {
@@ -123,38 +150,6 @@ pub fn collect_vectors_for_clustering(
     }
 
     collector_with_meta.collector
-}
-
-pub fn sample_vectors_if_needed(
-    collector: &VectorCollector,
-    max_sample_size: usize,
-    sample_threshold: usize,
-) -> (Vec<Vec<f32>>, Vec<pg_sys::ItemPointerData>) {
-    let num_vectors = collector.vectors.len();
-    let use_sampling = max_sample_size > 0 && (sample_threshold == 0 || num_vectors >= sample_threshold);
-
-    if use_sampling && num_vectors > max_sample_size {
-        let sample_interval = (num_vectors as f64 / max_sample_size as f64).ceil() as usize;
-        let mut sampled_vectors = Vec::new();
-        let mut sampled_heap_tids = Vec::new();
-        
-        for i in (0..num_vectors).step_by(sample_interval) {
-            sampled_vectors.push(collector.vectors[i].clone());
-            sampled_heap_tids.push(collector.heap_tids[i]);
-        }
-        
-        notice!(
-            "Sampled {} vectors out of {} total vectors (sampling ratio: {:.2}%)",
-            sampled_vectors.len(),
-            num_vectors,
-            (sampled_vectors.len() as f64 / num_vectors as f64) * 100.0
-        );
-        
-        (sampled_vectors, sampled_heap_tids)
-    } else {
-        notice!("Collected {} vectors for k-means clustering", num_vectors);
-        (collector.vectors.clone(), collector.heap_tids.clone())
-    }
 }
 
 pub fn build_index_with_clustering(
@@ -178,7 +173,13 @@ pub fn build_index_with_clustering(
         sample_threshold,
     );
 
-    let (vectors_for_clustering, _heap_tids_for_clustering) = sample_vectors_if_needed(&collector, max_sample_size, sample_threshold);
+    // Sampling is now applied during collection, so use the collected vectors directly
+    let vectors_for_clustering = collector.vectors;
+    let num_vectors = vectors_for_clustering.len();
+    
+    if num_vectors > 0 {
+        notice!("Collected {} vectors for k-means clustering", num_vectors);
+    }
 
     if vectors_for_clustering.len() < num_clusters {
         warning!(
@@ -608,6 +609,11 @@ unsafe extern "C-unwind" fn build_callback_collect_vectors(
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
+    // Check if the vector is NULL, skip if so
+    if *isnull {
+        return;
+    }
+
     let collector_with_meta = (state as *mut VectorCollectorWithMeta).as_mut().unwrap();
     let vec = PgVector::from_pg_parts(values, isnull, 0, collector_with_meta.meta_page, true, false);
     if let Some(vec) = vec {
@@ -754,6 +760,10 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
     };
 
     unsafe {
+        // Create the guard to ensure ConditionVariableCancelSleep is called on exit.
+        // This must be created before any code that might call ConditionVariableSleep.
+        let _cv_guard = CvSleepGuard;
+        
         let heaprel = pg_sys::table_open(params.heaprelid, heap_lockmode);
         let indexrel = pg_sys::index_open(params.indexrelid, index_lockmode);
         let heap_relation = PgRelation::from_pg(heaprel);
@@ -790,6 +800,9 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
         pg_sys::index_close(indexrel, index_lockmode);
         pg_sys::table_close(heaprel, heap_lockmode);
+        
+        // CvSleepGuard will automatically call ConditionVariableCancelSleep() when it goes out of scope.
+        // This ensures cv_sleep_target is cleared even if a panic occurs.
     }
 }
 
@@ -865,6 +878,18 @@ unsafe fn build_cluster_subgraph(
                         &mut write_stats,
                     );
 
+                    let labeled_vector = LabeledVector::new(
+                        PgVector::from_slice(&vector_data),
+                        None,
+                    );
+                    graph.insert(
+                        index_relation,
+                        index_pointer,
+                        labeled_vector,
+                        &mut plain,
+                        &mut insert_stats,
+                    );
+
                     if consumer_state.first_node.is_none() {
                         consumer_state.first_node = Some(index_pointer);
                     }
@@ -915,6 +940,18 @@ unsafe fn build_cluster_subgraph(
                         &mut write_stats,
                     );
 
+                    let labeled_vector = LabeledVector::new(
+                        PgVector::from_slice(&vector_data),
+                        None,
+                    );
+                    graph.insert(
+                        index_relation,
+                        index_pointer,
+                        labeled_vector,
+                        &mut bq,
+                        &mut insert_stats,
+                    );
+
                     if consumer_state.first_node.is_none() {
                         consumer_state.first_node = Some(index_pointer);
                     }
@@ -930,6 +967,6 @@ unsafe fn build_cluster_subgraph(
             graph.maybe_flush_neighbor_cache(&mut bq, &mut insert_stats);
         }
     }
-    
+
     notice!("Consumer for cluster {} processed {} vectors", cluster_id, consumer_state.ntuples);
 }

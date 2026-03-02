@@ -2,6 +2,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
 
+// Maximum number of clusters supported
+// This must match the maximum value used in the system
+pub const MAX_CLUSTERS: usize = 64;
+
 pub const SHM_TOC_SHARED_KEY: u64 = 0xD000000000000001;
 pub const SHM_TOC_TABLESCANDESC_KEY: u64 = 0xD000000000000002;
 pub const SHM_TOC_CLUSTER_QUEUES_KEY: u64 = 0xD000000000000003;
@@ -134,15 +138,15 @@ impl ClusterQueues {
     pub unsafe fn initialize(&self, base_ptr: *mut u8) {
         let header_size = std::mem::size_of::<ClusterQueues>();
         let headers_size = self.num_queues * std::mem::size_of::<ClusterQueueHeader>();
-        
+
         // Initialize queue headers
         let headers_ptr = base_ptr.add(header_size) as *mut ClusterQueueHeader;
         for i in 0..self.num_queues {
             let header_ptr = headers_ptr.add(i);
             *header_ptr = ClusterQueueHeader::new(self.queue_capacity, self.entry_size);
         }
-        
-        // Initialize condition variables
+
+        // Initialize condition variables for each queue
         let cv_ptr = base_ptr.add(header_size + headers_size) as *mut ConditionVariable;
         for i in 0..self.num_queues {
             let cv = cv_ptr.add(i);

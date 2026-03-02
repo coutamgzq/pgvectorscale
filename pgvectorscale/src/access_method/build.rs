@@ -314,7 +314,7 @@ pub extern "C-unwind" fn ambuild(
     );
 
     let num_clusters = crate::access_method::guc::TSV_NUM_CLUSTERS.get() as usize;
-    let use_clustering = num_clusters > 1;
+    let use_clustering = num_clusters > 0;
 
     if use_clustering {
         notice!("Using k-means clustering with {} clusters", num_clusters);
