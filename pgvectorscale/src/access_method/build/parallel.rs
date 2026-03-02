@@ -190,6 +190,125 @@ impl ClusterQueues {
         let cv_ptr = self.get_cv_ptr(base_ptr);
         cv_ptr.add(cluster_id)
     }
+
+    /// Push a vector to the queue for a specific cluster
+    /// Returns true if successful, false if the heap_tid is invalid
+    pub unsafe fn push_to_queue(
+        &self,
+        base_ptr: *mut u8,
+        cluster_id: usize,
+        heap_tid: pg_sys::ItemPointerData,
+        vector: &[f32],
+    ) -> bool {
+        if heap_tid.ip_posid == 0 || heap_tid.ip_posid == pg_sys::InvalidOffsetNumber {
+            return false;
+        }
+        
+        let block_num = pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid);
+        if block_num == pg_sys::InvalidBlockNumber {
+            return false;
+        }
+
+        let header = self.get_header(base_ptr, cluster_id);
+        let cv = self.get_cv(base_ptr, cluster_id);
+
+        loop {
+            let tail = (*header).tail.load(std::sync::atomic::Ordering::Acquire);
+            let head = (*header).head.load(std::sync::atomic::Ordering::Acquire);
+            let next_tail = (tail + 1) % (*header).capacity;
+
+            if next_tail != head {
+                let entry_ptr = self.get_entry(base_ptr, cluster_id, tail);
+                
+                (*entry_ptr).heap_tid = heap_tid;
+                (*entry_ptr).vector_len = vector.len() as u32;
+                
+                let vector_ptr = (entry_ptr as *mut u8)
+                    .add(std::mem::size_of::<ClusterQueueEntry>()) as *mut f32;
+                std::ptr::copy_nonoverlapping(vector.as_ptr(), vector_ptr, vector.len());
+
+                (*header).tail.store(next_tail, std::sync::atomic::Ordering::Release);
+                
+                pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                return true;
+            }
+
+            pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+        }
+    }
+
+    /// Pop a vector from the queue for a specific cluster
+    /// Returns Some((heap_tid, vector_data)) if successful, None if queue is empty
+    pub unsafe fn pop_from_queue(
+        &self,
+        base_ptr: *mut u8,
+        cluster_id: usize,
+    ) -> Option<(pg_sys::ItemPointerData, Vec<f32>)> {
+        let header = self.get_header(base_ptr, cluster_id);
+        let cv = self.get_cv(base_ptr, cluster_id);
+
+        let head = (*header).head.load(std::sync::atomic::Ordering::Acquire);
+        let tail = (*header).tail.load(std::sync::atomic::Ordering::Acquire);
+
+        if head == tail {
+            return None;
+        }
+
+        let entry_ptr = self.get_entry(base_ptr, cluster_id, head);
+        
+        let heap_tid = (*entry_ptr).heap_tid;
+        let vector_len = (*entry_ptr).vector_len as usize;
+        
+        if heap_tid.ip_posid == 0 || heap_tid.ip_posid == pg_sys::InvalidOffsetNumber {
+            let next_head = (head + 1) % (*header).capacity;
+            (*header).head.store(next_head, std::sync::atomic::Ordering::Release);
+            pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+            return None;
+        }
+        
+        let block_num = pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid);
+        if block_num == pg_sys::InvalidBlockNumber {
+            let next_head = (head + 1) % (*header).capacity;
+            (*header).head.store(next_head, std::sync::atomic::Ordering::Release);
+            pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+            return None;
+        }
+        
+        let vector_ptr = (entry_ptr as *const u8)
+            .add(std::mem::size_of::<ClusterQueueEntry>()) as *const f32;
+        let vector_data = std::slice::from_raw_parts(vector_ptr, vector_len).to_vec();
+
+        let next_head = (head + 1) % (*header).capacity;
+        (*header).head.store(next_head, std::sync::atomic::Ordering::Release);
+        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+
+        Some((heap_tid, vector_data))
+    }
+
+    /// Check if queue is finished (producer done and queue empty)
+    pub unsafe fn is_queue_finished(&self, base_ptr: *mut u8, cluster_id: usize) -> bool {
+        let header = self.get_header(base_ptr, cluster_id);
+        let head = (*header).head.load(std::sync::atomic::Ordering::Acquire);
+        let tail = (*header).tail.load(std::sync::atomic::Ordering::Acquire);
+        let finished = (*header).finished.load(std::sync::atomic::Ordering::Acquire);
+        
+        finished && head == tail
+    }
+
+    /// Wait on condition variable for this cluster's queue
+    pub unsafe fn wait_on_cv(&self, base_ptr: *mut u8, cluster_id: usize) {
+        let cv = self.get_cv(base_ptr, cluster_id);
+        pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+    }
+
+    /// Mark queue as finished (producer done)
+    pub unsafe fn mark_queue_finished(&self, base_ptr: *mut u8, cluster_id: usize) {
+        let header = self.get_header(base_ptr, cluster_id);
+        (*header).finished.store(true, std::sync::atomic::Ordering::Release);
+        
+        let cv = self.get_cv(base_ptr, cluster_id);
+        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+    }
 }
 
 #[repr(C)]
