@@ -127,8 +127,12 @@ impl LloydKMeans {
                 o = (o + 1) % c;
             }
             centroids[i] = centroids[o].clone();
-            kmeans_helper(&mut centroids[i], 1.0 + DELTA, 1.0 - DELTA);
-            kmeans_helper(&mut centroids[o], 1.0 - DELTA, 1.0 + DELTA);
+            // Use random perturbation instead of fixed offset
+            // This avoids all centroids converging to similar values in high dimensions
+            for val in centroids[i].iter_mut() {
+                let perturbation = rng.gen_range(-DELTA..DELTA);
+                *val = *val + perturbation;
+            }
             count[i] = count[o] / 2.0;
             count[o] -= count[i];
         }
@@ -190,8 +194,4 @@ fn vector_mul_scalar(a: &[f32], scalar: f32) -> Vec<f32> {
 
 fn vector_mul_scalar_inplace(a: &mut [f32], scalar: f32) {
     a.iter_mut().for_each(|x| *x *= scalar);
-}
-
-fn kmeans_helper(a: &mut [f32], alpha: f32, beta: f32) {
-    a.iter_mut().for_each(|x| *x = *x * alpha + beta);
 }
