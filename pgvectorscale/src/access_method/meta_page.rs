@@ -88,6 +88,7 @@ impl From<&MetaPageV1> for MetaPage {
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels: false,
             cluster_start_nodes: BTreeMap::new(),
+            centroids: Vec::new(),
         }
     }
 }
@@ -160,6 +161,7 @@ impl From<MetaPageV2> for MetaPage {
             quantizer_metadata: meta.quantizer_metadata,
             has_labels: false,
             cluster_start_nodes: BTreeMap::new(),
+            centroids: Vec::new(),
         }
     }
 }
@@ -211,6 +213,8 @@ pub struct MetaPage {
     /// Whether the index has labels
     has_labels: bool,
     cluster_start_nodes: BTreeMap<u32, ItemPointer>,
+    /// K-means cluster centroids stored as Vec<Vec<f32>>
+    centroids: Vec<Vec<f32>>,
 }
 
 impl MetaPage {
@@ -285,6 +289,14 @@ impl MetaPage {
         }
     }
 
+    pub fn get_centroids(&self) -> &Vec<Vec<f32>> {
+        &self.centroids
+    }
+
+    pub fn set_centroids(&mut self, centroids: Vec<Vec<f32>>) {
+        self.centroids = centroids;
+    }
+
     fn calculate_num_neighbors(opt: &PgBox<TSVIndexOptions>) -> u32 {
         let num_neighbors = (*opt).get_num_neighbors();
         if num_neighbors == NUM_NEIGHBORS_DEFAULT_SENTINEL {
@@ -355,6 +367,7 @@ impl MetaPage {
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels,
             cluster_start_nodes: BTreeMap::new(),
+            centroids: Vec::new(),
         };
 
         meta.store(index, true);

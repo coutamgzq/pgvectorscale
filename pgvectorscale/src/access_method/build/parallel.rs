@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
 
@@ -86,26 +86,6 @@ impl ClusterQueueHeader {
             finished: AtomicBool::new(false),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
-    }
-
-    pub fn is_full(&self) -> bool {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        (tail + 1) % self.capacity == head
-    }
-
-    pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        if tail >= head {
-            tail - head
-        } else {
-            self.capacity - head + tail
-        }
-    }
 }
 
 #[repr(C)]
@@ -115,54 +95,100 @@ pub struct ClusterQueueEntry {
     pub vector_len: u32,
 }
 
-pub const MAX_VECTOR_DIMENSIONS: usize = 2000;
-
+/// ClusterQueues structure with dynamically-sized arrays
+/// The actual memory layout is:
+/// [ClusterQueues header][queue_headers (num_queues items)][condition_vars (num_queues items)][queue data (num_queues * queue_capacity items)]
 #[repr(C)]
 pub struct ClusterQueues {
     pub num_queues: usize,
-    pub queue_headers: [ClusterQueueHeader; 64],
-    pub condition_vars: [ConditionVariable; 64],
-    pub entry_size: usize,    // Size of each entry
-    pub queue_capacity: usize, // Capacity of each queue
+    pub entry_size: usize,       // Size of each entry
+    pub queue_capacity: usize,   // Capacity of each queue
+    // Flexible array members follow (not declared here, computed via offsets)
+    // queue_headers: [ClusterQueueHeader; num_queues]
+    // condition_vars: [ConditionVariable; num_queues]
+    // queue_data: [u8; num_queues * queue_capacity * entry_size]
 }
 
 impl ClusterQueues {
-    pub fn new(num_queues: usize, queue_capacity: usize, num_dimensions: usize) -> Self {
+    /// Calculate the total size needed for ClusterQueues with given parameters
+    pub fn calculate_size(num_queues: usize, queue_capacity: usize, num_dimensions: usize) -> usize {
         let entry_size = std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>();
-        let mut queues = Self {
+        let header_size = std::mem::size_of::<ClusterQueues>();
+        let headers_size = num_queues * std::mem::size_of::<ClusterQueueHeader>();
+        let cv_size = num_queues * std::mem::size_of::<ConditionVariable>();
+        let data_size = num_queues * queue_capacity * entry_size;
+        
+        header_size + headers_size + cv_size + data_size
+    }
+
+    pub fn new(num_queues: usize, queue_capacity: usize, num_dimensions: usize) -> Self {
+        Self {
             num_queues,
-            queue_headers: unsafe { std::mem::zeroed() },
-            condition_vars: unsafe { std::mem::zeroed() },
-            entry_size,
+            entry_size: std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>(),
             queue_capacity,
-        };
-
-        for i in 0..num_queues {
-            queues.queue_headers[i] = ClusterQueueHeader::new(
-                queue_capacity,
-                entry_size,
-            );
-            unsafe {
-                pg_sys::ConditionVariableInit(&mut queues.condition_vars[i]);
-            }
-        }
-        queues
-    }
-
-    /// Get pointer to queue data storage (immediately following this struct)
-    pub fn queue_data_ptr(&self) -> *mut u8 {
-        unsafe {
-            (self as *const Self as *mut u8).add(std::mem::size_of::<Self>())
         }
     }
 
-    pub fn get_entry(&self, cluster_id: usize, index: usize) -> *mut ClusterQueueEntry {
-        unsafe {
-            self.queue_data_ptr()
-                .add(cluster_id * self.entry_size * self.queue_capacity)
-                .add(index * self.entry_size)
-                .cast::<ClusterQueueEntry>()
+    /// Initialize the ClusterQueues structure in pre-allocated memory
+    /// This should be called immediately after allocating memory via shm_toc_allocate
+    pub unsafe fn initialize(&self, base_ptr: *mut u8) {
+        let header_size = std::mem::size_of::<ClusterQueues>();
+        let headers_size = self.num_queues * std::mem::size_of::<ClusterQueueHeader>();
+        
+        // Initialize queue headers
+        let headers_ptr = base_ptr.add(header_size) as *mut ClusterQueueHeader;
+        for i in 0..self.num_queues {
+            let header_ptr = headers_ptr.add(i);
+            *header_ptr = ClusterQueueHeader::new(self.queue_capacity, self.entry_size);
         }
+        
+        // Initialize condition variables
+        let cv_ptr = base_ptr.add(header_size + headers_size) as *mut ConditionVariable;
+        for i in 0..self.num_queues {
+            let cv = cv_ptr.add(i);
+            pg_sys::ConditionVariableInit(cv);
+        }
+    }
+
+    /// Get pointer to queue headers array
+    pub unsafe fn get_headers_ptr(&self, base_ptr: *mut u8) -> *mut ClusterQueueHeader {
+        base_ptr.add(std::mem::size_of::<ClusterQueues>()) as *mut ClusterQueueHeader
+    }
+
+    /// Get pointer to condition variables array
+    pub unsafe fn get_cv_ptr(&self, base_ptr: *mut u8) -> *mut ConditionVariable {
+        let header_size = std::mem::size_of::<ClusterQueues>();
+        let headers_size = self.num_queues * std::mem::size_of::<ClusterQueueHeader>();
+        base_ptr.add(header_size + headers_size) as *mut ConditionVariable
+    }
+
+    /// Get pointer to queue data storage
+    pub unsafe fn get_data_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
+        let header_size = std::mem::size_of::<ClusterQueues>();
+        let headers_size = self.num_queues * std::mem::size_of::<ClusterQueueHeader>();
+        let cv_size = self.num_queues * std::mem::size_of::<ConditionVariable>();
+        base_ptr.add(header_size + headers_size + cv_size)
+    }
+
+    /// Get pointer to a specific queue entry
+    pub unsafe fn get_entry(&self, base_ptr: *mut u8, cluster_id: usize, index: usize) -> *mut ClusterQueueEntry {
+        let data_ptr = self.get_data_ptr(base_ptr);
+        data_ptr
+            .add(cluster_id * self.entry_size * self.queue_capacity)
+            .add(index * self.entry_size)
+            .cast::<ClusterQueueEntry>()
+    }
+
+    /// Get queue header for a specific cluster
+    pub unsafe fn get_header(&self, base_ptr: *mut u8, cluster_id: usize) -> *mut ClusterQueueHeader {
+        let headers_ptr = self.get_headers_ptr(base_ptr);
+        headers_ptr.add(cluster_id)
+    }
+
+    /// Get condition variable for a specific cluster
+    pub unsafe fn get_cv(&self, base_ptr: *mut u8, cluster_id: usize) -> *mut ConditionVariable {
+        let cv_ptr = self.get_cv_ptr(base_ptr);
+        cv_ptr.add(cluster_id)
     }
 }
 
@@ -210,9 +236,5 @@ impl ClusterStartNodes {
     }
 }
 
-pub fn calculate_queue_size(num_dimensions: usize, capacity: usize) -> usize {
-    let entry_size = std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>();
-    entry_size * capacity + std::mem::size_of::<ClusterQueueHeader>()
-}
-
+/// Default capacity for each queue
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;

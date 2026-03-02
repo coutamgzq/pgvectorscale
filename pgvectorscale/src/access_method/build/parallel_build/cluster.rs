@@ -190,6 +190,9 @@ pub fn build_index_with_clustering(
     let (centroids, _cluster_assignments) = perform_clustering(vectors_for_clustering, num_clusters);
     let actual_num_clusters = centroids.len();
 
+    // Save centroids to meta page
+    meta_page.set_centroids(centroids.clone());
+
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
     }
@@ -304,10 +307,19 @@ fn do_parallel_cluster_build(
     num_dimensions: usize,
 ) -> usize {
     let num_clusters = centroids.len();
+    let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
+    
     notice!(
         "Parallel cluster build with {} workers for {} clusters",
         workers, num_clusters
     );
+    notice!(
+        "Indexing {} vectors with {} dimensions",
+        heap_tuples, num_dimensions
+    );
+
+    // Record start time for statistics
+    let start_time = std::time::Instant::now();
 
     unsafe {
         pg_sys::EnterParallelMode();
@@ -328,9 +340,7 @@ fn do_parallel_cluster_build(
         parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ParallelShared>());
         
         // ClusterQueues structure + queue data storage (contiguous)
-        let cluster_queues_size = std::mem::size_of::<ClusterQueues>() + 
-            num_clusters * DEFAULT_QUEUE_CAPACITY * 
-            (std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>());
+        let cluster_queues_size = ClusterQueues::calculate_size(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
         parallel::toc_estimate_single_chunk(pcxt, cluster_queues_size);
 
         let centroids_size = std::mem::size_of::<usize>() 
@@ -388,16 +398,16 @@ fn do_parallel_cluster_build(
         pg_sys::ConditionVariableInit(&raw mut (*parallel_shared).build_state.initialization_cv);
 
         // Allocate cluster queues structure + data (contiguous)
-        let cluster_queues_size = std::mem::size_of::<ClusterQueues>() + 
-            num_clusters * DEFAULT_QUEUE_CAPACITY * 
-            (std::mem::size_of::<ClusterQueueEntry>() + num_dimensions * std::mem::size_of::<f32>());
         let cluster_queues = pg_sys::shm_toc_allocate(
             (*pcxt).toc,
             cluster_queues_size,
         )
         .cast::<ClusterQueues>();
         
-        (*cluster_queues) = ClusterQueues::new(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        // Initialize ClusterQueues in allocated memory
+        let queues_template = ClusterQueues::new(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        std::ptr::write(cluster_queues, queues_template);
+        (*cluster_queues).initialize(cluster_queues as *mut u8);
 
         let centroids_ptr = pg_sys::shm_toc_allocate(
             (*pcxt).toc,
@@ -480,14 +490,12 @@ fn do_parallel_cluster_build(
             .producer_done
             .store(true, Ordering::Release);
 
+        let base_ptr = cluster_queues as *mut u8;
         for i in 0..num_clusters {
-            (*cluster_queues)
-                .queue_headers[i]
-                .finished
-                .store(true, Ordering::Release);
-            pg_sys::ConditionVariableBroadcast(
-                &(*cluster_queues).condition_vars[i] as *const _ as *mut _,
-            );
+            let header = (*cluster_queues).get_header(base_ptr, i);
+            (*header).finished.store(true, Ordering::Release);
+            let cv = (*cluster_queues).get_cv(base_ptr, i);
+            pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
         }
 
         (*parallel_shared)
@@ -503,6 +511,29 @@ fn do_parallel_cluster_build(
             .load(Ordering::Relaxed);
 
         collect_cluster_start_nodes(cluster_start_nodes, meta_page, index_relation);
+
+        // Record and report timing statistics
+        let elapsed = start_time.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        notice!(
+            "Parallel cluster build completed: {} vectors in {:.2}s ({:.0} vectors/sec)",
+            ntuples,
+            elapsed_secs,
+            ntuples as f64 / elapsed_secs
+        );
+        notice!(
+            "  - DSM setup: {} workers, {} clusters",
+            num_clusters,
+            num_clusters
+        );
+        notice!(
+            "  - Queue capacity: {} entries per cluster",
+            DEFAULT_QUEUE_CAPACITY
+        );
+        notice!(
+            "  - Total shared memory: {} bytes",
+            cluster_queues_size
+        );
 
         parallel::cleanup_parallel_context(pcxt, snapshot);
         ntuples
@@ -676,16 +707,17 @@ unsafe fn push_to_queue(
     }
     
     let queues = &mut *cluster_queues;
-    let header = &mut queues.queue_headers[cluster_id];
-    let cv = &queues.condition_vars[cluster_id];
+    let base_ptr = cluster_queues as *mut u8;
+    let header = unsafe { queues.get_header(base_ptr, cluster_id) };
+    let cv = unsafe { queues.get_cv(base_ptr, cluster_id) };
 
     loop {
-        let tail = header.tail.load(Ordering::Acquire);
-        let head = header.head.load(Ordering::Acquire);
-        let next_tail = (tail + 1) % header.capacity;
+        let tail = unsafe { (*header).tail.load(Ordering::Acquire) };
+        let head = unsafe { (*header).head.load(Ordering::Acquire) };
+        let next_tail = (tail + 1) % (*header).capacity;
 
         if next_tail != head {
-            let entry_ptr = (*cluster_queues).get_entry(cluster_id, tail);
+            let entry_ptr = unsafe { queues.get_entry(base_ptr, cluster_id, tail) };
             
             // Debug: Check heap_tid before writing
             let block_num = pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid);
@@ -693,20 +725,26 @@ unsafe fn push_to_queue(
             notice!("Producer: Writing to cluster {} tail {} - block={}, offset={}", 
                     cluster_id, tail, block_num, offset_num);
             
-            (*entry_ptr).heap_tid = heap_tid;
-            (*entry_ptr).vector_len = num_dimensions as u32;
-            
-            let vector_ptr = (entry_ptr as *mut u8)
-                .add(std::mem::size_of::<ClusterQueueEntry>()) as *mut f32;
-            std::ptr::copy_nonoverlapping(vector.as_ptr(), vector_ptr, num_dimensions);
+            unsafe {
+                (*entry_ptr).heap_tid = heap_tid;
+                (*entry_ptr).vector_len = num_dimensions as u32;
+                
+                let vector_ptr = (entry_ptr as *mut u8)
+                    .add(std::mem::size_of::<ClusterQueueEntry>()) as *mut f32;
+                std::ptr::copy_nonoverlapping(vector.as_ptr(), vector_ptr, num_dimensions);
 
-            header.tail.store(next_tail, Ordering::Release);
+                (*header).tail.store(next_tail, Ordering::Release);
+            }
             
-            pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+            unsafe {
+                pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+            }
             return;
         }
 
-        pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+        unsafe {
+            pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+        }
     }
 }
 
@@ -771,13 +809,13 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
         notice!("Consumer {}: num_queues = {}", worker_number, (*cluster_queues).num_queues);
         notice!("Consumer {}: entry_size = {}", worker_number, (*cluster_queues).entry_size);
         notice!("Consumer {}: queue_capacity = {}", worker_number, (*cluster_queues).queue_capacity);
-        notice!("Consumer {}: queue_data_ptr = {:?}", worker_number, (*cluster_queues).queue_data_ptr());
         
         // Check queue header for this cluster
-        let header = &(*cluster_queues).queue_headers[cluster_id];
+        let base_ptr = cluster_queues as *mut u8;
+        let header = (*cluster_queues).get_header(base_ptr, cluster_id);
         notice!("Consumer {}: header head={}, tail={}, capacity={}", 
-                worker_number, header.head.load(Ordering::Acquire), 
-                header.tail.load(Ordering::Acquire), header.capacity);
+                worker_number, (*header).head.load(Ordering::Acquire), 
+                (*header).tail.load(Ordering::Acquire), (*header).capacity);
     }
 
     let (heap_lockmode, index_lockmode) = if params.is_concurrent {
@@ -849,8 +887,9 @@ unsafe fn build_cluster_subgraph(
     _centroids: &[Vec<f32>],
 ) {
     let queues = &mut *consumer_state.cluster_queues;
-    let header = &mut queues.queue_headers[consumer_state.cluster_id];
-    let cv = &queues.condition_vars[consumer_state.cluster_id];
+    let base_ptr = consumer_state.cluster_queues as *mut u8;
+    let header = queues.get_header(base_ptr, consumer_state.cluster_id);
+    let cv = queues.get_cv(base_ptr, consumer_state.cluster_id);
 
     let storage_type = meta_page.get_storage_type();
     const BUILDER_NEIGHBOR_CACHE_SIZE: f64 = 0.8;
@@ -879,38 +918,38 @@ unsafe fn build_cluster_subgraph(
             );
 
             loop {
-                let head = header.head.load(Ordering::Acquire);
-                let tail = header.tail.load(Ordering::Acquire);
+                let head = unsafe { (*header).head.load(Ordering::Acquire) };
+                let tail = unsafe { (*header).tail.load(Ordering::Acquire) };
 
                 if head != tail {
-                    let entry_ptr = (*consumer_state.cluster_queues).get_entry(consumer_state.cluster_id, head);
+                    let entry_ptr = queues.get_entry(base_ptr, consumer_state.cluster_id, head);
                     
-                    let heap_tid = (*entry_ptr).heap_tid;
-                    let vector_len = (*entry_ptr).vector_len as usize;
+                    let heap_tid = unsafe { (*entry_ptr).heap_tid };
+                    let vector_len = unsafe { (*entry_ptr).vector_len } as usize;
                     
                     // Validate heap_tid before processing
                     if heap_tid.ip_posid == 0 {
                         notice!("Consumer {}: Skipping invalid heap_tid (ip_posid=0)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
                     if heap_tid.ip_posid == pg_sys::InvalidOffsetNumber {
                         notice!("Consumer {}: Skipping invalid heap_tid (ip_posid=InvalidOffsetNumber)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
                     let block_num = pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid);
                     if block_num == pg_sys::InvalidBlockNumber {
                         notice!("Consumer {}: Skipping invalid heap_tid (block_num=InvalidBlockNumber)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
@@ -922,10 +961,10 @@ unsafe fn build_cluster_subgraph(
                         .add(std::mem::size_of::<ClusterQueueEntry>()) as *const f32;
                     let vector_data = std::slice::from_raw_parts(vector_ptr, vector_len);
 
-                    let next_head = (head + 1) % header.capacity;
-                    header.head.store(next_head, Ordering::Release);
+                    let next_head = (head + 1) % unsafe { (*header).capacity };
+                    unsafe { (*header).head.store(next_head, Ordering::Release) };
 
-                    pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                    unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
 
                     // Create ItemPointer directly from heap_tid fields to avoid validation
                     let heap_pointer = ItemPointer::new(
@@ -957,10 +996,10 @@ unsafe fn build_cluster_subgraph(
                     }
 
                     consumer_state.ntuples += 1;
-                } else if header.finished.load(Ordering::Acquire) {
+                } else if unsafe { (*header).finished.load(Ordering::Acquire) } {
                     break;
                 } else {
-                    pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+                    unsafe { pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION) };
                 }
             }
 
@@ -977,38 +1016,38 @@ unsafe fn build_cluster_subgraph(
             };
 
             loop {
-                let head = header.head.load(Ordering::Acquire);
-                let tail = header.tail.load(Ordering::Acquire);
+                let head = unsafe { (*header).head.load(Ordering::Acquire) };
+                let tail = unsafe { (*header).tail.load(Ordering::Acquire) };
 
                 if head != tail {
-                    let entry_ptr = (*consumer_state.cluster_queues).get_entry(consumer_state.cluster_id, head);
+                    let entry_ptr = queues.get_entry(base_ptr, consumer_state.cluster_id, head);
                     
-                    let heap_tid = (*entry_ptr).heap_tid;
-                    let vector_len = (*entry_ptr).vector_len as usize;
+                    let heap_tid = unsafe { (*entry_ptr).heap_tid };
+                    let vector_len = unsafe { (*entry_ptr).vector_len } as usize;
                     
                     // Validate heap_tid before processing
                     if heap_tid.ip_posid == 0 {
                         notice!("Consumer {}: Skipping invalid heap_tid (ip_posid=0)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
                     if heap_tid.ip_posid == pg_sys::InvalidOffsetNumber {
                         notice!("Consumer {}: Skipping invalid heap_tid (ip_posid=InvalidOffsetNumber)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
                     let block_num = pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid);
                     if block_num == pg_sys::InvalidBlockNumber {
                         notice!("Consumer {}: Skipping invalid heap_tid (block_num=InvalidBlockNumber)", consumer_state.cluster_id);
-                        let next_head = (head + 1) % header.capacity;
-                        header.head.store(next_head, Ordering::Release);
-                        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                        let next_head = (head + 1) % unsafe { (*header).capacity };
+                        unsafe { (*header).head.store(next_head, Ordering::Release) };
+                        unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
                         continue;
                     }
                     
@@ -1016,10 +1055,10 @@ unsafe fn build_cluster_subgraph(
                         .add(std::mem::size_of::<ClusterQueueEntry>()) as *const f32;
                     let vector_data = std::slice::from_raw_parts(vector_ptr, vector_len);
 
-                    let next_head = (head + 1) % header.capacity;
-                    header.head.store(next_head, Ordering::Release);
+                    let next_head = (head + 1) % unsafe { (*header).capacity };
+                    unsafe { (*header).head.store(next_head, Ordering::Release) };
 
-                    pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
+                    unsafe { pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _) };
 
                     // Create ItemPointer directly from heap_tid fields to avoid validation
                     let heap_pointer = ItemPointer::new(
@@ -1051,15 +1090,23 @@ unsafe fn build_cluster_subgraph(
                     }
 
                     consumer_state.ntuples += 1;
-                } else if header.finished.load(Ordering::Acquire) {
+                } else if unsafe { (*header).finished.load(Ordering::Acquire) } {
                     break;
                 } else {
-                    pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION);
+                    unsafe { pg_sys::ConditionVariableSleep(cv as *const _ as *mut _, pg_sys::PG_WAIT_EXTENSION) };
                 }
             }
 
             graph.maybe_flush_neighbor_cache(&mut bq, &mut insert_stats);
         }
+    }
+
+    // Broadcast to wake up any producer waiting on this queue
+    // This must be done before the consumer exits to prevent the producer
+    // from waiting indefinitely on a condition variable in shared memory
+    // that may be detached when the worker exits
+    unsafe {
+        pg_sys::ConditionVariableBroadcast(cv as *const _ as *mut _);
     }
 
     notice!(
