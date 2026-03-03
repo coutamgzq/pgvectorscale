@@ -815,6 +815,82 @@ struct ConsumerState {
     first_node: Option<crate::util::ItemPointer>,
 }
 
+/// Process vectors from queue and build graph for a single cluster.
+/// This is a generic function that works with any Storage implementation.
+unsafe fn process_cluster_vectors<S: Storage>(
+    consumer_state: &mut ConsumerState,
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+    queues: &ClusterQueues,
+    base_ptr: *mut u8,
+    cluster_id: usize,
+    flush_interval: usize,
+    storage: &mut S,
+    graph: &mut Graph,
+    tape: &mut Tape,
+    write_stats: &mut WriteStats,
+) {
+    let mut insert_stats = InsertStats::default();
+
+    loop {
+        if let Some((heap_tid, vector_data)) = queues.pop_from_queue(base_ptr, cluster_id) {
+            let heap_pointer = ItemPointer::new(
+                pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid),
+                pgrx::itemptr::item_pointer_get_offset_number_no_check(heap_tid),
+            );
+
+            let distance_type = meta_page.get_distance_type();
+            let vector_slice: Vec<f32> = match distance_type {
+                DistanceType::Cosine => {
+                    let mut normalized = vector_data.to_vec();
+                    distance::preprocess_cosine(&mut normalized);
+                    normalized
+                }
+                _ => vector_data.to_vec(),
+            };
+
+            let index_pointer = storage.create_node(
+                &vector_slice,
+                None,
+                heap_pointer,
+                meta_page,
+                tape,
+                write_stats,
+            );
+
+            let labeled_vector = LabeledVector::new(
+                PgVector::from_slice(&vector_data),
+                None,
+            );
+            graph.insert(
+                index_relation,
+                index_pointer,
+                labeled_vector,
+                storage,
+                &mut insert_stats,
+            );
+
+            if consumer_state.first_node.is_none() {
+                consumer_state.first_node = Some(index_pointer);
+            }
+
+            consumer_state.ntuples += 1;
+
+            // Periodically flush neighbor cache to reduce disk I/O
+            if consumer_state.ntuples % flush_interval == 0 {
+                graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+            }
+        } else if queues.is_queue_finished(base_ptr, cluster_id) {
+            break;
+        } else {
+            queues.wait_on_cv(base_ptr, cluster_id);
+        }
+    }
+
+    // Final flush after all vectors are processed
+    graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+}
+
 unsafe fn build_cluster_subgraph(
     consumer_state: &mut ConsumerState,
     heap_relation: &PgRelation,
@@ -842,7 +918,10 @@ unsafe fn build_cluster_subgraph(
 
     let mut tape = unsafe { Tape::new(index_relation, PageType::Node) };
     let mut write_stats = WriteStats::default();
-    let mut insert_stats = InsertStats::default();
+
+    // Get total vectors from parallel shared state for flush interval calculation
+    let total_vectors = unsafe { (*consumer_state._parallel_shared).params.total_vectors };
+    let flush_interval = parallel::flush_rate(total_vectors);
 
     match storage_type {
         StorageType::Plain => {
@@ -852,57 +931,19 @@ unsafe fn build_cluster_subgraph(
                 graph.get_meta_page(),
             );
 
-            loop {
-                if let Some((heap_tid, vector_data)) = queues.pop_from_queue(base_ptr, cluster_id) {
-                    let heap_pointer = ItemPointer::new(
-                        pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid),
-                        pgrx::itemptr::item_pointer_get_offset_number_no_check(heap_tid),
-                    );
-
-                    let distance_type = meta_page.get_distance_type();
-                    let vector_slice: Vec<f32> = match distance_type {
-                        DistanceType::Cosine => {
-                            let mut normalized = vector_data.to_vec();
-                            distance::preprocess_cosine(&mut normalized);
-                            normalized
-                        }
-                        _ => vector_data.to_vec(),
-                    };
-
-                    let index_pointer = plain.create_node(
-                        &vector_slice,
-                        None,
-                        heap_pointer,
-                        meta_page,
-                        &mut tape,
-                        &mut write_stats,
-                    );
-
-                    let labeled_vector = LabeledVector::new(
-                        PgVector::from_slice(&vector_data),
-                        None,
-                    );
-                    graph.insert(
-                        index_relation,
-                        index_pointer,
-                        labeled_vector,
-                        &mut plain,
-                        &mut insert_stats,
-                    );
-
-                    if consumer_state.first_node.is_none() {
-                        consumer_state.first_node = Some(index_pointer);
-                    }
-
-                    consumer_state.ntuples += 1;
-                } else if queues.is_queue_finished(base_ptr, cluster_id) {
-                    break;
-                } else {
-                    queues.wait_on_cv(base_ptr, cluster_id);
-                }
-            }
-
-            graph.maybe_flush_neighbor_cache(&mut plain, &mut insert_stats);
+            process_cluster_vectors(
+                consumer_state,
+                index_relation,
+                meta_page,
+                queues,
+                base_ptr,
+                cluster_id,
+                flush_interval,
+                &mut plain,
+                &mut graph,
+                &mut tape,
+                &mut write_stats,
+            );
         }
         StorageType::SbqCompression => {
             let mut bq = unsafe {
@@ -914,57 +955,19 @@ unsafe fn build_cluster_subgraph(
                 )
             };
 
-            loop {
-                if let Some((heap_tid, vector_data)) = queues.pop_from_queue(base_ptr, cluster_id) {
-                    let heap_pointer = ItemPointer::new(
-                        pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid),
-                        pgrx::itemptr::item_pointer_get_offset_number_no_check(heap_tid),
-                    );
-
-                    let distance_type = meta_page.get_distance_type();
-                    let vector_slice: Vec<f32> = match distance_type {
-                        DistanceType::Cosine => {
-                            let mut normalized = vector_data.to_vec();
-                            distance::preprocess_cosine(&mut normalized);
-                            normalized
-                        }
-                        _ => vector_data.to_vec(),
-                    };
-
-                    let index_pointer = bq.create_node(
-                        &vector_slice,
-                        None,
-                        heap_pointer,
-                        meta_page,
-                        &mut tape,
-                        &mut write_stats,
-                    );
-
-                    let labeled_vector = LabeledVector::new(
-                        PgVector::from_slice(&vector_data),
-                        None,
-                    );
-                    graph.insert(
-                        index_relation,
-                        index_pointer,
-                        labeled_vector,
-                        &mut bq,
-                        &mut insert_stats,
-                    );
-
-                    if consumer_state.first_node.is_none() {
-                        consumer_state.first_node = Some(index_pointer);
-                    }
-
-                    consumer_state.ntuples += 1;
-                } else if queues.is_queue_finished(base_ptr, cluster_id) {
-                    break;
-                } else {
-                    queues.wait_on_cv(base_ptr, cluster_id);
-                }
-            }
-
-            graph.maybe_flush_neighbor_cache(&mut bq, &mut insert_stats);
+            process_cluster_vectors(
+                consumer_state,
+                index_relation,
+                meta_page,
+                queues,
+                base_ptr,
+                cluster_id,
+                flush_interval,
+                &mut bq,
+                &mut graph,
+                &mut tape,
+                &mut write_stats,
+            );
         }
     }
 

@@ -2,10 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
 
-// Maximum number of clusters supported
-// This must match the maximum value used in the system
-pub const MAX_CLUSTERS: usize = 64;
-
 pub const SHM_TOC_SHARED_KEY: u64 = 0xD000000000000001;
 pub const SHM_TOC_TABLESCANDESC_KEY: u64 = 0xD000000000000002;
 pub const SHM_TOC_CLUSTER_QUEUES_KEY: u64 = 0xD000000000000003;

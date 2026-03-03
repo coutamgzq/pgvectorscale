@@ -495,6 +495,13 @@ impl<'a> Graph<'a> {
         storage: &S,
         stats: &mut PruneNeighborStats,
     ) {
+        // In Builder mode (used during parallel index construction), skip updating
+        // start nodes and meta page storage to avoid concurrent write conflicts.
+        // Start nodes will be set after the build is complete.
+        if matches!(self.neighbor_store, GraphNeighborStore::Builder(_)) {
+            return;
+        }
+
         match self.meta_page.get_start_nodes() {
             Some(start_nodes) => {
                 if start_nodes.contains_all(vec.labels()) {

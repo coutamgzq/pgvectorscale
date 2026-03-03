@@ -51,6 +51,39 @@ impl Drop for PgVector {
 }
 
 impl PgVector {
+    /// Creates a PgVector from a slice of f32 values
+    pub fn from_slice(data: &[f32]) -> Self {
+        unsafe {
+            let inner = Self::create_inner_from_slice(data);
+            PgVector {
+                index_distance: Some(inner),
+                index_distance_needs_pfree: true,
+                full_distance: Some(inner),
+                full_distance_needs_pfree: false,
+            }
+        }
+    }
+
+    unsafe fn create_inner_from_slice(data: &[f32]) -> *mut PgVectorInternal {
+        let header_size = std::mem::size_of::<PgVectorInternal>();
+        let array_size = data.len() * std::mem::size_of::<f32>();
+        let total_size = header_size + array_size;
+
+        // Allocate PostgreSQL memory
+        let ptr = pg_sys::palloc(total_size) as *mut PgVectorInternal;
+
+        // Initialize the header
+        (*ptr).vl_len_ = total_size as i32;
+        (*ptr).dim = data.len() as i16;
+        (*ptr).unused = MaybeUninit::new(0);
+
+        // Copy the data
+        let dest_slice = (*ptr).x.as_mut_slice(data.len());
+        dest_slice.copy_from_slice(data);
+
+        ptr
+    }
+
     /// Creates a zero-filled PgVector with the specified dimensions
     pub fn zeros(meta_page: &meta_page::MetaPage) -> Self {
         let num_dimensions = meta_page.get_num_dimensions();
