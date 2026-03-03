@@ -391,6 +391,7 @@ fn do_parallel_cluster_build(
                 producer_done: AtomicBool::new(false),
                 producer_ntuples: AtomicUsize::new(0),
                 consumers_finished: AtomicUsize::new(0),
+                start_nodes_initialized: AtomicBool::new(false),
                 initialization_cv: std::mem::zeroed(),
             },
         };

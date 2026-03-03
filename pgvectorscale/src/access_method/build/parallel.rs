@@ -50,6 +50,7 @@ pub struct ParallelBuildState {
     pub producer_done: AtomicBool,
     pub producer_ntuples: AtomicUsize,
     pub consumers_finished: AtomicUsize,
+    pub start_nodes_initialized: AtomicBool,
     pub initialization_cv: ConditionVariable,
 }
 

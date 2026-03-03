@@ -407,6 +407,7 @@ pub extern "C-unwind" fn ambuild(
                         producer_done: AtomicBool::new(false),
                         producer_ntuples: AtomicUsize::new(0),
                         consumers_finished: AtomicUsize::new(0),
+                        start_nodes_initialized: AtomicBool::new(false),
                         initialization_cv: std::mem::zeroed(), // Will be initialized below
                     },
                 };
@@ -664,11 +665,13 @@ pub extern "C-unwind" fn _vectorscale_build_main(
     };
 
     // Check if this worker should handle the first 1024 nodes for start node initialization
+    // Use compare_exchange to ensure only one worker becomes the initializing worker
     let should_initialize = unsafe {
         (*parallel_shared)
             .build_state
-            .producer_ntuples
-            .load(Ordering::Relaxed) < parallel::initial_start_nodes_count()
+            .start_nodes_initialized
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     };
 
     if !should_initialize {
@@ -1153,18 +1156,8 @@ fn build_callback_internal<S: Storage>(
 
     state.ntuples += 1;
 
-    let distance_type = state.graph.get_meta_page().get_distance_type();
-    let vector_slice = match distance_type {
-        DistanceType::Cosine => {
-            let mut normalized = vector.vec().to_index_slice().to_vec();
-            crate::access_method::distance::preprocess_cosine(&mut normalized);
-            normalized
-        }
-        _ => vector.vec().to_index_slice().to_vec(),
-    };
-
     let index_pointer = storage.create_node(
-        &vector_slice,
+        vector.vec().to_index_slice(),
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1207,18 +1200,9 @@ fn build_callback_parallel_internal<S: Storage>(
 
     state.increment_ntuples();
 
-    let distance_type = state.graph.get_meta_page().get_distance_type();
-    let vector_slice = match distance_type {
-        DistanceType::Cosine => {
-            let mut normalized = vector.vec().to_index_slice().to_vec();
-            crate::access_method::distance::preprocess_cosine(&mut normalized);
-            normalized
-        }
-        _ => vector.vec().to_index_slice().to_vec(),
-    };
-
+    // Create node using local tape - PostgreSQL page locking handles concurrency
     let index_pointer = storage.create_node(
-        &vector_slice,
+        vector.vec().to_index_slice(),
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
