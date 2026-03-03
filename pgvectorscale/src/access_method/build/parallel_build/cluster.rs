@@ -339,12 +339,12 @@ fn do_parallel_cluster_build(
         };
 
         parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ParallelShared>());
-        
+
         // ClusterQueues structure + queue data storage (contiguous)
         let cluster_queues_size = ClusterQueues::calculate_size(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
         parallel::toc_estimate_single_chunk(pcxt, cluster_queues_size);
 
-        let centroids_size = std::mem::size_of::<usize>() 
+        let centroids_size = std::mem::size_of::<usize>()
             + num_clusters * (std::mem::size_of::<usize>() + num_dimensions * std::mem::size_of::<f32>());
         parallel::toc_estimate_single_chunk(pcxt, centroids_size);
 
@@ -394,6 +394,7 @@ fn do_parallel_cluster_build(
                 start_nodes_initialized: AtomicBool::new(false),
                 initialization_cv: std::mem::zeroed(),
             },
+            meta_page_ptr: std::ptr::null_mut(),
         };
         parallel_shared.write(shared_state);
 
@@ -764,11 +765,13 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
         // Create the guard to ensure ConditionVariableCancelSleep is called on exit.
         // This must be created before any code that might call ConditionVariableSleep.
         let _cv_guard = CvSleepGuard;
-        
+
         let heaprel = pg_sys::table_open(params.heaprelid, heap_lockmode);
         let indexrel = pg_sys::index_open(params.indexrelid, index_lockmode);
         let heap_relation = PgRelation::from_pg(heaprel);
         let index_relation = PgRelation::from_pg(indexrel);
+        // Each worker loads its own MetaPage copy (read-only)
+        // We don't share MetaPage because it contains heap-allocated fields (BTreeMap, Vec)
         let mut meta_page = MetaPage::fetch(&index_relation);
 
         let mut consumer_state = ConsumerState {
@@ -801,7 +804,7 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
         pg_sys::index_close(indexrel, index_lockmode);
         pg_sys::table_close(heaprel, heap_lockmode);
-        
+
         // CvSleepGuard will automatically call ConditionVariableCancelSleep() when it goes out of scope.
         // This ensures cv_sleep_target is cleared even if a panic occurs.
     }

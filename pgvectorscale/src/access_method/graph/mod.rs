@@ -335,15 +335,30 @@ impl<'a> Graph<'a> {
         storage: &S,
     ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
         let start_nodes = self.get_start_nodes();
-        if start_nodes.is_none() {
-            //no nodes in the graph
+
+        // Get start nodes: use start_nodes for non-cluster builds,
+        // or cluster_start_nodes for cluster builds
+        let start_nodes_vec: Vec<ItemPointer> = if let Some(start_nodes) = start_nodes {
+            // Non-cluster build: use start_nodes
+            start_nodes.get_for_node(query.labels())
+        } else {
+            // Cluster build: use cluster_start_nodes
+            let cluster_start_nodes = self.meta_page.get_all_cluster_start_nodes();
+            if cluster_start_nodes.is_empty() {
+                return ListSearchResult::empty();
+            }
+            // Collect all cluster start nodes
+            cluster_start_nodes.values().copied().collect()
+        };
+
+        if start_nodes_vec.is_empty() {
             return ListSearchResult::empty();
         }
-        let start_nodes = start_nodes.unwrap().get_for_node(query.labels());
+
         let dm = storage.get_query_distance_measure(query);
         let num_neighbors = self.meta_page.get_num_neighbors();
         ListSearchResult::new(
-            start_nodes,
+            start_nodes_vec,
             dm,
             None,
             search_list_size,
@@ -495,12 +510,10 @@ impl<'a> Graph<'a> {
         storage: &S,
         stats: &mut PruneNeighborStats,
     ) {
-        // In Builder mode (used during parallel index construction), skip updating
-        // start nodes and meta page storage to avoid concurrent write conflicts.
-        // Start nodes will be set after the build is complete.
-        // if matches!(self.neighbor_store, GraphNeighborStore::Builder(_)) {
-        //     return;
-        // }
+        // For cluster builds, set start_nodes in memory but don't store to disk.
+        // This allows greedy_search_for_build to work correctly during graph construction.
+        // Cluster start nodes are managed separately via set_cluster_start_node.
+        let is_cluster_build = !self.meta_page.get_centroids().is_empty();
 
         match self.meta_page.get_start_nodes() {
             Some(start_nodes) => {
@@ -534,8 +547,12 @@ impl<'a> Graph<'a> {
             }
         }
 
-        unsafe {
-            self.meta_page.store(index, false);
+        // Only store meta page to disk for non-cluster builds.
+        // For cluster builds, start_nodes is kept in memory only.
+        if !is_cluster_build {
+            unsafe {
+                self.meta_page.store(index, false);
+            }
         }
     }
 

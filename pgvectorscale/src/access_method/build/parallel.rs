@@ -58,6 +58,9 @@ pub struct ParallelBuildState {
 pub struct ParallelShared {
     pub params: ParallelSharedParams,
     pub build_state: ParallelBuildState,
+    /// Pointer to shared MetaPage for cluster builds.
+    /// This is used to share the same MetaPage instance across all worker processes.
+    pub meta_page_ptr: *mut crate::access_method::meta_page::MetaPage,
 }
 
 #[derive(Debug)]

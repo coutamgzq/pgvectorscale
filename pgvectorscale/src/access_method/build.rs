@@ -10,6 +10,7 @@ use pgrx::*;
 
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
+use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::pg_vector::PgVector;
@@ -410,6 +411,8 @@ pub extern "C-unwind" fn ambuild(
                         start_nodes_initialized: AtomicBool::new(false),
                         initialization_cv: std::mem::zeroed(), // Will be initialized below
                     },
+                    // For non-cluster builds, meta_page is shared via reference conversion
+                    meta_page_ptr: std::ptr::null_mut(),
                 };
                 parallel_shared.write(shared_state);
 
@@ -988,6 +991,14 @@ fn finalize_index_build<S: Storage>(
     let BuildState { graph, ntuples, .. } = state;
     let (neighbor_store, meta_page) = graph.into_parts();
     let cache_entries = neighbor_store.into_sorted();
+
+    // Set the first node as the start node if not already set
+    if meta_page.get_start_nodes().is_none() {
+        if let Some((first_index_pointer, _)) = cache_entries.first() {
+            let start_nodes = StartNodes::new(*first_index_pointer);
+            meta_page.set_start_nodes(start_nodes);
+        }
+    }
 
     for (index_pointer, entry) in cache_entries {
         write_stats.num_nodes += 1;
