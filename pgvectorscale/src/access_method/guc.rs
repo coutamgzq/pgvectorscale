@@ -6,7 +6,7 @@ pub static TSV_PARALLEL_FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new
 pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
-pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(1);
+pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub static TSV_CLUSTERING_MAX_SAMPLE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100000);
 pub static TSV_CLUSTERING_SAMPLE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000000);
 
