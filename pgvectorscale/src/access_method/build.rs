@@ -3,9 +3,7 @@ use std::time::Instant;
 
 use pg_sys::{FunctionCall0Coll, InvalidOid};
 use pgrx::ffi::c_char;
-use pgrx::pg_sys::{
-    index_getprocinfo, pgstat_progress_update_param, AsPgCStr,
-};
+use pgrx::pg_sys::{index_getprocinfo, pgstat_progress_update_param, AsPgCStr};
 use pgrx::*;
 
 use crate::access_method::distance::DistanceType;
@@ -39,7 +37,7 @@ use super::storage::{Storage, StorageType};
 mod parallel;
 pub mod parallel_build;
 
-pub use parallel::{ParallelShared, ParallelSharedParams, ParallelBuildState, ParallelBuildInfo};
+pub use parallel::{ParallelBuildInfo, ParallelBuildState, ParallelShared, ParallelSharedParams};
 
 pub struct SbqTrainState<'a, 'b> {
     pub quantizer: &'a mut SbqQuantizer,
@@ -359,128 +357,133 @@ pub extern "C-unwind" fn ambuild(
         } else {
             0
         };
-    let is_concurrent = unsafe { (*index_info).ii_Concurrent };
-    struct ParallelData {
-        pcxt: *mut pg_sys::ParallelContext,
-        snapshot: *mut pg_sys::SnapshotData,
-    }
-    let parallel_data = if workers > 0 {
-        notice!("Parallel build with {} workers", workers);
-        unsafe {
-            pg_sys::EnterParallelMode();
+        let is_concurrent = unsafe { (*index_info).ii_Concurrent };
+        struct ParallelData {
+            pcxt: *mut pg_sys::ParallelContext,
+            snapshot: *mut pg_sys::SnapshotData,
+        }
+        let parallel_data = if workers > 0 {
+            notice!("Parallel build with {} workers", workers);
+            unsafe {
+                pg_sys::EnterParallelMode();
 
-            let pcxt = pg_sys::CreateParallelContext(
-                crate::EXTENSION_NAME,
-                PARALLEL_BUILD_MAIN,
-                workers as i32,
-            );
-            let snapshot = if is_concurrent {
-                pg_sys::RegisterSnapshot(pg_sys::GetTransactionSnapshot())
-            } else {
-                &raw mut pg_sys::SnapshotAnyData
-            };
-
-            // Estimate things we put in shared memory
-            parallel::toc_estimate_single_chunk(pcxt, size_of::<ParallelShared>());
-            let tablescandesc_size_estimate =
-                pg_sys::table_parallelscan_estimate(heaprel, snapshot);
-            parallel::toc_estimate_single_chunk(pcxt, tablescandesc_size_estimate);
-
-            pg_sys::InitializeParallelDSM(pcxt);
-            // need DSM segment to do parallel build
-            if (*pcxt).seg.is_null() {
-                parallel::cleanup_parallel_context(pcxt, snapshot);
-                None
-            } else {
-                let parallel_shared =
-                    pg_sys::shm_toc_allocate((*pcxt).toc, size_of::<ParallelShared>())
-                        .cast::<ParallelShared>();
-                let shared_state = ParallelShared {
-                    params: ParallelSharedParams {
-                        heaprelid: heap_relation.rd_id,
-                        indexrelid: index_relation.rd_id,
-                        is_concurrent,
-                        num_clusters: workers as usize,
-                        total_vectors: heap_tuples,
-                        num_dimensions: meta_page.get_num_dimensions_to_index() as usize,
-                    },
-                    build_state: ParallelBuildState {
-                        producer_done: AtomicBool::new(false),
-                        producer_ntuples: AtomicUsize::new(0),
-                        consumers_finished: AtomicUsize::new(0),
-                        start_nodes_initialized: AtomicBool::new(false),
-                        initialization_cv: std::mem::zeroed(), // Will be initialized below
-                    },
-                    // For non-cluster builds, meta_page is shared via reference conversion
-                    meta_page_ptr: std::ptr::null_mut(),
+                let pcxt = pg_sys::CreateParallelContext(
+                    crate::EXTENSION_NAME,
+                    PARALLEL_BUILD_MAIN,
+                    workers as i32,
+                );
+                let snapshot = if is_concurrent {
+                    pg_sys::RegisterSnapshot(pg_sys::GetTransactionSnapshot())
+                } else {
+                    &raw mut pg_sys::SnapshotAnyData
                 };
-                parallel_shared.write(shared_state);
 
-                // Initialize the condition variable
-                pg_sys::ConditionVariableInit(
-                    &raw mut (*parallel_shared).build_state.initialization_cv,
-                );
-                let tablescandesc =
-                    pg_sys::shm_toc_allocate((*pcxt).toc, tablescandesc_size_estimate)
-                        .cast::<pg_sys::ParallelTableScanDescData>();
-                pg_sys::table_parallelscan_initialize(heaprel, tablescandesc, snapshot);
+                // Estimate things we put in shared memory
+                parallel::toc_estimate_single_chunk(pcxt, size_of::<ParallelShared>());
+                let tablescandesc_size_estimate =
+                    pg_sys::table_parallelscan_estimate(heaprel, snapshot);
+                parallel::toc_estimate_single_chunk(pcxt, tablescandesc_size_estimate);
 
-                pg_sys::shm_toc_insert(
-                    (*pcxt).toc,
-                    parallel::SHM_TOC_SHARED_KEY,
-                    parallel_shared.cast(),
-                );
-                pg_sys::shm_toc_insert(
-                    (*pcxt).toc,
-                    parallel::SHM_TOC_TABLESCANDESC_KEY,
-                    tablescandesc.cast(),
-                );
-
-                pg_sys::LaunchParallelWorkers(pcxt);
-                if (*pcxt).nworkers_launched == 0 {
-                    warning!("No workers launched");
+                pg_sys::InitializeParallelDSM(pcxt);
+                // need DSM segment to do parallel build
+                if (*pcxt).seg.is_null() {
                     parallel::cleanup_parallel_context(pcxt, snapshot);
                     None
                 } else {
-                    pg_sys::WaitForParallelWorkersToAttach(pcxt);
-                    Some(ParallelData { pcxt, snapshot })
+                    let parallel_shared =
+                        pg_sys::shm_toc_allocate((*pcxt).toc, size_of::<ParallelShared>())
+                            .cast::<ParallelShared>();
+                    let shared_state = ParallelShared {
+                        params: ParallelSharedParams {
+                            heaprelid: heap_relation.rd_id,
+                            indexrelid: index_relation.rd_id,
+                            is_concurrent,
+                            num_clusters: workers as usize,
+                            total_vectors: heap_tuples,
+                            num_dimensions: meta_page.get_num_dimensions_to_index() as usize,
+                        },
+                        build_state: ParallelBuildState {
+                            producer_done: AtomicBool::new(false),
+                            producer_ntuples: AtomicUsize::new(0),
+                            consumers_finished: AtomicUsize::new(0),
+                            start_nodes_initialized: AtomicBool::new(false),
+                            initialization_cv: std::mem::zeroed(), // Will be initialized below
+                            assignments_ready: AtomicBool::new(false),
+                            assignments_cv: std::mem::zeroed(), // Will be initialized below
+                        },
+                        // For non-cluster builds, meta_page is shared via reference conversion
+                        meta_page_ptr: std::ptr::null_mut(),
+                    };
+                    parallel_shared.write(shared_state);
+
+                    // Initialize the condition variables
+                    pg_sys::ConditionVariableInit(
+                        &raw mut (*parallel_shared).build_state.initialization_cv,
+                    );
+                    pg_sys::ConditionVariableInit(
+                        &raw mut (*parallel_shared).build_state.assignments_cv,
+                    );
+                    let tablescandesc =
+                        pg_sys::shm_toc_allocate((*pcxt).toc, tablescandesc_size_estimate)
+                            .cast::<pg_sys::ParallelTableScanDescData>();
+                    pg_sys::table_parallelscan_initialize(heaprel, tablescandesc, snapshot);
+
+                    pg_sys::shm_toc_insert(
+                        (*pcxt).toc,
+                        parallel::SHM_TOC_SHARED_KEY,
+                        parallel_shared.cast(),
+                    );
+                    pg_sys::shm_toc_insert(
+                        (*pcxt).toc,
+                        parallel::SHM_TOC_TABLESCANDESC_KEY,
+                        tablescandesc.cast(),
+                    );
+
+                    pg_sys::LaunchParallelWorkers(pcxt);
+                    if (*pcxt).nworkers_launched == 0 {
+                        warning!("No workers launched");
+                        parallel::cleanup_parallel_context(pcxt, snapshot);
+                        None
+                    } else {
+                        pg_sys::WaitForParallelWorkersToAttach(pcxt);
+                        Some(ParallelData { pcxt, snapshot })
+                    }
                 }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    let ntuples = if let Some(ParallelData { pcxt, snapshot }) = parallel_data {
-        unsafe {
-            pg_sys::WaitForParallelWorkersToFinish(pcxt);
-            let parallel_shared: *mut ParallelShared =
-                pg_sys::shm_toc_lookup((*pcxt).toc, parallel::SHM_TOC_SHARED_KEY, false)
-                    .cast::<ParallelShared>();
-            let ntuples = (*parallel_shared)
-                .build_state
-                .producer_ntuples
-                .load(Ordering::Relaxed);
-            parallel::cleanup_parallel_context(pcxt, snapshot);
-            ntuples
-        }
-    } else {
-        do_heap_scan(
-            index_info,
-            &heap_relation,
-            &index_relation,
-            meta_page,
-            write_stats,
-            None,
-            workers as usize,
-        )
-    };
+        let ntuples = if let Some(ParallelData { pcxt, snapshot }) = parallel_data {
+            unsafe {
+                pg_sys::WaitForParallelWorkersToFinish(pcxt);
+                let parallel_shared: *mut ParallelShared =
+                    pg_sys::shm_toc_lookup((*pcxt).toc, parallel::SHM_TOC_SHARED_KEY, false)
+                        .cast::<ParallelShared>();
+                let ntuples = (*parallel_shared)
+                    .build_state
+                    .producer_ntuples
+                    .load(Ordering::Relaxed);
+                parallel::cleanup_parallel_context(pcxt, snapshot);
+                ntuples
+            }
+        } else {
+            do_heap_scan(
+                index_info,
+                &heap_relation,
+                &index_relation,
+                meta_page,
+                write_stats,
+                None,
+                workers as usize,
+            )
+        };
 
-    let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
-    result.heap_tuples = ntuples as f64;
-    result.index_tuples = ntuples as f64;
+        let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
+        result.heap_tuples = ntuples as f64;
+        result.index_tuples = ntuples as f64;
 
-    result.into_pg()
+        result.into_pg()
     }
 }
 
@@ -893,7 +896,8 @@ pub fn do_heap_scan_with_clustering(
                         cluster_assignments,
                         cluster_id: 0,
                     };
-                    let mut filter_state = ClusterFilterState::Plain(&mut plain, &mut bs, &filter_context);
+                    let mut filter_state =
+                        ClusterFilterState::Plain(&mut plain, &mut bs, &filter_context);
 
                     unsafe {
                         pg_sys::IndexBuildHeapScan(
@@ -940,7 +944,8 @@ pub fn do_heap_scan_with_clustering(
                         cluster_assignments,
                         cluster_id: 0,
                     };
-                    let mut filter_state = ClusterFilterState::SbqSpeedup(&mut bq, &mut bs, &filter_context);
+                    let mut filter_state =
+                        ClusterFilterState::SbqSpeedup(&mut bq, &mut bs, &filter_context);
 
                     unsafe {
                         pg_sys::IndexBuildHeapScan(
@@ -1237,7 +1242,6 @@ fn build_callback_parallel_internal<S: Storage>(
     }
 }
 
-
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_cluster(
     index: pg_sys::Relation,
@@ -1250,27 +1254,24 @@ unsafe extern "C-unwind" fn build_callback_cluster(
     let heap_pointer = ItemPointer::with_item_pointer_data(*ctid);
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut ClusterFilterState).as_mut().unwrap();
-    
+
     let filter_context = match state {
         ClusterFilterState::SbqSpeedup(_, _, ctx) => ctx,
         ClusterFilterState::Plain(_, _, ctx) => ctx,
     };
-    
-    let vector_index = filter_context
-        .heap_tids
-        .iter()
-        .position(|tid| {
-            let tid_block = unsafe { pgrx::itemptr::item_pointer_get_block_number(tid) };
-            let tid_offset = unsafe { pgrx::itemptr::item_pointer_get_offset_number(tid) };
-            tid_block == heap_pointer.block_number && tid_offset == heap_pointer.offset
-        });
-    
+
+    let vector_index = filter_context.heap_tids.iter().position(|tid| {
+        let tid_block = unsafe { pgrx::itemptr::item_pointer_get_block_number(tid) };
+        let tid_offset = unsafe { pgrx::itemptr::item_pointer_get_offset_number(tid) };
+        tid_block == heap_pointer.block_number && tid_offset == heap_pointer.offset
+    });
+
     if let Some(idx) = vector_index {
         if filter_context.cluster_assignments[idx] != filter_context.cluster_id {
             return;
         }
     }
-    
+
     match state {
         ClusterFilterState::SbqSpeedup(bq, state, _) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
 
@@ -7,11 +7,8 @@ pub const SHM_TOC_TABLESCANDESC_KEY: u64 = 0xD000000000000002;
 pub const SHM_TOC_CLUSTER_QUEUES_KEY: u64 = 0xD000000000000003;
 pub const SHM_TOC_CENTROIDS_KEY: u64 = 0xD000000000000004;
 pub const SHM_TOC_CLUSTER_START_NODES_KEY: u64 = 0xD000000000000005;
-pub const SHM_TOC_WORKER_ASSIGNMENTS_KEY: u64 = 0xD000000000000006;
-pub const SHM_TOC_CLUSTER_SIZES_KEY: u64 = 0xD000000000000007;
-
-pub const MAX_WORKERS: usize = 64;
-pub const MAX_CLUSTERS: usize = 64;
+pub const SHM_TOC_CLUSTER_SIZES_KEY: u64 = 0xD000000000000006;
+pub const SHM_TOC_WORKER_ASSIGNMENTS_KEY: u64 = 0xD000000000000007;
 
 pub fn flush_rate(total_vectors: usize) -> usize {
     let rate = crate::access_method::guc::TSV_PARALLEL_FLUSH_INTERVAL.get();
@@ -56,8 +53,10 @@ pub struct ParallelBuildState {
     pub consumers_finished: AtomicUsize,
     pub start_nodes_initialized: AtomicBool,
     pub initialization_cv: ConditionVariable,
-    pub assignments_ready: AtomicBool,
+    /// Condition variable for worker assignments ready notification
     pub assignments_cv: ConditionVariable,
+    /// Flag indicating worker assignments are ready
+    pub assignments_ready: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -66,6 +65,7 @@ pub struct ParallelShared {
     pub build_state: ParallelBuildState,
     /// Pointer to shared MetaPage for cluster builds.
     /// This is used to share the same MetaPage instance across all worker processes.
+    #[allow(dead_code)]
     pub meta_page_ptr: *mut crate::access_method::meta_page::MetaPage,
 }
 
@@ -414,7 +414,6 @@ impl ClusterQueues {
 
     /// Pop multiple vectors from the queue for a specific cluster in batch
     /// Returns the number of vectors popped, stored in the provided buffer
-    /// The buffer should be pre-allocated with the expected dimensions
     pub unsafe fn pop_batch_from_queue(
         &self,
         base_ptr: *mut u8,
@@ -542,16 +541,19 @@ impl ClusterStartNodes {
 }
 
 /// Default capacity for each queue
-pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+pub const DEFAULT_QUEUE_CAPACITY: usize = 10240;
 
+/// Maximum number of workers supported
+pub const MAX_WORKERS: usize = 64;
+
+/// Worker assignment for dynamic load balancing
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct WorkerAssignment {
     pub cluster_id: usize,
     pub start_idx: usize,
     pub end_idx: usize,
     pub is_primary: bool,
-    pub is_valid: bool,
 }
 
 impl WorkerAssignment {
@@ -561,76 +563,83 @@ impl WorkerAssignment {
             start_idx,
             end_idx,
             is_primary,
-            is_valid: true,
-        }
-    }
-
-    pub fn invalid() -> Self {
-        Self {
-            cluster_id: 0,
-            start_idx: 0,
-            end_idx: 0,
-            is_primary: false,
-            is_valid: false,
         }
     }
 }
 
+/// Shared worker assignments for all workers
 #[repr(C)]
 pub struct WorkerAssignments {
-    pub num_assignments: usize,
     pub assignments: [WorkerAssignment; MAX_WORKERS],
+    pub num_assignments: AtomicUsize,
+    pub ready: AtomicBool,
 }
 
 impl WorkerAssignments {
     pub fn new() -> Self {
         Self {
-            num_assignments: 0,
-            assignments: [WorkerAssignment::invalid(); MAX_WORKERS],
+            assignments: unsafe { std::mem::zeroed() },
+            num_assignments: AtomicUsize::new(0),
+            ready: AtomicBool::new(false),
         }
     }
 
-    pub fn set_assignment(&mut self, index: usize, assignment: WorkerAssignment) {
-        if index < MAX_WORKERS {
-            self.assignments[index] = assignment;
-            if index >= self.num_assignments {
-                self.num_assignments = index + 1;
+    pub fn set_assignment(&mut self, worker_id: usize, assignment: WorkerAssignment) {
+        if worker_id < MAX_WORKERS {
+            self.assignments[worker_id] = assignment;
+            let count = self.num_assignments.load(Ordering::Acquire);
+            if worker_id >= count {
+                self.num_assignments.store(worker_id + 1, Ordering::Release);
             }
         }
     }
 
-    pub fn get_assignment(&self, index: usize) -> Option<WorkerAssignment> {
-        if index < self.num_assignments && self.assignments[index].is_valid {
-            Some(self.assignments[index])
+    pub fn get_assignment(&self, worker_id: usize) -> Option<WorkerAssignment> {
+        let count = self.num_assignments.load(Ordering::Acquire);
+        if worker_id < count {
+            Some(self.assignments[worker_id])
         } else {
             None
         }
     }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
 }
 
+/// Cluster sizes tracking for dynamic worker allocation
 #[repr(C)]
 pub struct ClusterSizes {
+    pub sizes: [AtomicUsize; 64],
     pub num_clusters: usize,
-    pub sizes: [AtomicUsize; MAX_CLUSTERS],
 }
 
 impl ClusterSizes {
     pub fn new(num_clusters: usize) -> Self {
+        let mut sizes: [AtomicUsize; 64] = unsafe { std::mem::zeroed() };
+        for i in 0..64 {
+            sizes[i] = AtomicUsize::new(0);
+        }
         Self {
-            num_clusters,
-            sizes: unsafe { std::mem::zeroed() },
+            sizes,
+            num_clusters: num_clusters.min(64),
         }
     }
 
     pub fn increment(&self, cluster_id: usize) {
         if cluster_id < self.num_clusters {
-            self.sizes[cluster_id].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.sizes[cluster_id].fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub fn get(&self, cluster_id: usize) -> usize {
         if cluster_id < self.num_clusters {
-            self.sizes[cluster_id].load(std::sync::atomic::Ordering::Relaxed)
+            self.sizes[cluster_id].load(Ordering::Relaxed)
         } else {
             0
         }
@@ -638,11 +647,12 @@ impl ClusterSizes {
 
     pub fn get_all(&self) -> Vec<usize> {
         (0..self.num_clusters)
-            .map(|i| self.sizes[i].load(std::sync::atomic::Ordering::Relaxed))
+            .map(|i| self.sizes[i].load(Ordering::Relaxed))
             .collect()
     }
 }
 
+/// Calculate worker assignments based on cluster sizes
 pub fn calculate_worker_assignments(
     cluster_sizes: &[usize],
     num_workers: usize,
@@ -653,7 +663,6 @@ pub fn calculate_worker_assignments(
     }
 
     let mut assignments = Vec::new();
-    let mut worker_id = 0;
 
     for (cluster_id, &size) in cluster_sizes.iter().enumerate() {
         if size == 0 {
@@ -662,10 +671,15 @@ pub fn calculate_worker_assignments(
 
         let workers_for_cluster = {
             let ideal = (size as f64 * num_workers as f64 / total_vectors as f64).ceil() as usize;
-            ideal.max(1).min(size)
+            ideal.max(1).min(size).min(num_workers - assignments.len())
         };
 
+        if workers_for_cluster == 0 {
+            continue;
+        }
+
         let chunk_size = (size + workers_for_cluster - 1) / workers_for_cluster;
+
         for i in 0..workers_for_cluster {
             let start_idx = i * chunk_size;
             let end_idx = ((i + 1) * chunk_size).min(size);
@@ -676,11 +690,10 @@ pub fn calculate_worker_assignments(
                 end_idx,
                 i == 0,
             ));
-            worker_id += 1;
+        }
 
-            if worker_id >= num_workers {
-                return assignments;
-            }
+        if assignments.len() >= num_workers {
+            break;
         }
     }
 
