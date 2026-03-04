@@ -459,4 +459,9 @@ impl MetaPage {
             self.cluster_start_nodes.len()
         }
     }
+
+    /// Get centroid for a specific cluster
+    pub fn get_centroid(&self, cluster_id: u32) -> Option<&Vec<f32>> {
+        self.centroids.get(cluster_id as usize)
+    }
 }

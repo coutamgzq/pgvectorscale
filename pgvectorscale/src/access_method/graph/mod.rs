@@ -11,6 +11,7 @@ use pgrx::PgRelation;
 use crate::access_method::storage::NodeDistanceMeasure;
 use crate::util::{HeapPointer, IndexPointer, ItemPointer};
 
+use super::guc;
 use super::labels::{LabelSet, LabelSetView, LabeledVector};
 use super::meta_page::MetaPage;
 use super::stats::{GreedySearchStats, InsertStats, PruneNeighborStats, StatsNodeVisit};
@@ -338,27 +339,88 @@ impl<'a> Graph<'a> {
 
         // Get start nodes: use start_nodes for non-cluster builds,
         // or cluster_start_nodes for cluster builds
-        let start_nodes_vec: Vec<ItemPointer> = if let Some(start_nodes) = start_nodes {
+        if let Some(start_nodes) = start_nodes {
             // Non-cluster build: use start_nodes
-            start_nodes.get_for_node(query.labels())
-        } else {
-            // Cluster build: use cluster_start_nodes
-            let cluster_start_nodes = self.meta_page.get_all_cluster_start_nodes();
-            if cluster_start_nodes.is_empty() {
+            let start_nodes_vec = start_nodes.get_for_node(query.labels());
+            if start_nodes_vec.is_empty() {
                 return ListSearchResult::empty();
             }
-            // Collect all cluster start nodes
-            cluster_start_nodes.values().copied().collect()
-        };
 
-        if start_nodes_vec.is_empty() {
+            let dm = storage.get_query_distance_measure(query);
+            let num_neighbors = self.meta_page.get_num_neighbors();
+            ListSearchResult::new(
+                start_nodes_vec,
+                dm,
+                None,
+                search_list_size,
+                num_neighbors,
+                self.get_neighbor_store(),
+                storage,
+            )
+        } else {
+            // Cluster build: search nearest clusters based on centroid distance
+            self.search_nearest_clusters(query, search_list_size, storage)
+        }
+    }
+
+    /// Search nearest clusters based on centroid distance.
+    /// This selects the top K clusters whose centroids are closest to the query vector,
+    /// then searches only those clusters.
+    fn search_nearest_clusters<S: Storage>(
+        &mut self,
+        query: LabeledVector,
+        search_list_size: usize,
+        storage: &S,
+    ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
+        let cluster_start_nodes = self.meta_page.get_all_cluster_start_nodes();
+        let centroids = self.meta_page.get_centroids();
+
+        if cluster_start_nodes.is_empty() || centroids.is_empty() {
             return ListSearchResult::empty();
         }
 
-        let dm = storage.get_query_distance_measure(query);
+        let dm = storage.get_query_distance_measure(query.clone());
         let num_neighbors = self.meta_page.get_num_neighbors();
+        let distance_fn = self.meta_page.get_distance_function();
+
+        // Calculate distance from query vector to all centroids
+        let mut cluster_distances: Vec<(f32, u32, ItemPointer)> = Vec::new();
+        let query_vec = query.vec().to_index_slice();
+
+        for (cluster_id, start_node) in cluster_start_nodes.iter() {
+            if let Some(centroid) = centroids.get(*cluster_id as usize) {
+                let dist = distance_fn(query_vec, centroid);
+                cluster_distances.push((dist, *cluster_id, *start_node));
+            }
+        }
+
+        if cluster_distances.is_empty() {
+            return ListSearchResult::empty();
+        }
+
+        // Sort by distance (ascending)
+        cluster_distances.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Get top K nearest clusters
+        let k = guc::TSV_CLUSTER_SEARCH_TOP_K.get() as usize;
+        let k = k.min(cluster_distances.len()); // Ensure we don't exceed available clusters
+
+        let selected_start_nodes: Vec<ItemPointer> = cluster_distances
+            .into_iter()
+            .take(k)
+            .map(|(_, _, start_node)| start_node)
+            .collect();
+
+        if selected_start_nodes.is_empty() {
+            return ListSearchResult::empty();
+        }
+
+        // Create ListSearchResult with selected clusters' start nodes
         ListSearchResult::new(
-            start_nodes_vec,
+            selected_start_nodes,
             dm,
             None,
             search_list_size,

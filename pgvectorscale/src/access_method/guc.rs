@@ -9,6 +9,7 @@ pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(
 pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub static TSV_CLUSTERING_MAX_SAMPLE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100000);
 pub static TSV_CLUSTERING_SAMPLE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000000);
+pub static TSV_CLUSTER_SEARCH_TOP_K: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -161,6 +162,23 @@ pub fn init() {
         &TSV_CLUSTERING_SAMPLE_THRESHOLD,
         0,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.cluster_search_top_k".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Number of nearest clusters to search based on centroid distance".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("Select the top K nearest clusters based on centroid distance for search. Higher values increase recall at the cost of speed.".as_pg_cstr())
+        },
+        &TSV_CLUSTER_SEARCH_TOP_K,
+        1,
+        1024,
         GucContext::Userset,
         GucFlags::default(),
     );
