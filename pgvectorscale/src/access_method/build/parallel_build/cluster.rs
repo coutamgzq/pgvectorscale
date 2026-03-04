@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use pgrx::ffi::c_char;
 use pgrx::pg_sys::{self, pgstat_progress_update_param};
 use pgrx::*;
+use rand::Rng;
 
 use crate::access_method::distance;
 use crate::access_method::distance::DistanceType;
@@ -327,10 +328,42 @@ fn do_parallel_cluster_build(
 
     let start_time = std::time::Instant::now();
 
+    // Phase 1: Sampling scan to determine cluster sizes
+    // This allows us to properly size queues and assign workers
+    let sample_rate = if heap_tuples > 100000 {
+        0.1 // Sample 10% for large tables
+    } else {
+        1.0 // Full scan for small tables
+    };
+
+    let sampling_result = unsafe {
+        sampling_scan(
+            heaprel,
+            indexrel,
+            index_info,
+            meta_page,
+            centroids,
+            sample_rate,
+        )
+    };
+
+    // Calculate queue capacities based on cluster sizes
+    let queue_capacities = calculate_queue_capacities(
+        &sampling_result.cluster_stats,
+        sampling_result.total_vectors,
+    );
+
+    // Calculate worker distribution
+    let num_workers = workers.min(MAX_WORKERS).max(num_clusters);
+    let worker_distribution =
+        calculate_worker_distribution(&sampling_result.cluster_stats, num_workers);
+
+    notice!("Queue capacities: {:?}", queue_capacities);
+    notice!("Worker distribution: {:?}", worker_distribution);
+
     unsafe {
         pg_sys::EnterParallelMode();
 
-        let num_workers = workers.min(MAX_WORKERS).max(num_clusters);
         let pcxt = pg_sys::CreateParallelContext(
             crate::EXTENSION_NAME,
             PARALLEL_BUILD_CLUSTER_CONSUMER_MAIN,
@@ -345,8 +378,11 @@ fn do_parallel_cluster_build(
 
         parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ParallelShared>());
 
-        let cluster_queues_size =
-            ClusterQueues::calculate_size(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        // Calculate total queue size with dynamic capacities
+        let cluster_queues_size: usize = queue_capacities
+            .iter()
+            .map(|&cap| ClusterQueues::calculate_size(1, cap, num_dimensions))
+            .sum();
         parallel::toc_estimate_single_chunk(pcxt, cluster_queues_size);
 
         let centroids_size = std::mem::size_of::<usize>()
@@ -416,11 +452,15 @@ fn do_parallel_cluster_build(
         let cluster_queues =
             pg_sys::shm_toc_allocate((*pcxt).toc, cluster_queues_size).cast::<ClusterQueues>();
 
-        // Initialize ClusterQueues in allocated memory
-        let queues_template =
-            ClusterQueues::new(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        // Initialize ClusterQueues in allocated memory with dynamic capacities
+        let max_capacity = queue_capacities
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(DEFAULT_QUEUE_CAPACITY);
+        let queues_template = ClusterQueues::new(num_clusters, max_capacity, num_dimensions);
         std::ptr::write(cluster_queues, queues_template);
-        (*cluster_queues).initialize(cluster_queues as *mut u8);
+        (*cluster_queues).initialize_with_capacities(cluster_queues as *mut u8, &queue_capacities);
 
         let centroids_ptr = pg_sys::shm_toc_allocate((*pcxt).toc, centroids_size).cast::<u8>();
         write_centroids_to_shmem(centroids_ptr, centroids, num_dimensions);
@@ -524,20 +564,45 @@ fn do_parallel_cluster_build(
         let final_cluster_sizes = (*cluster_sizes).get_all();
         notice!("Cluster sizes after scan: {:?}", final_cluster_sizes);
 
-        let assignments = parallel::calculate_worker_assignments(&final_cluster_sizes, launched);
-        notice!("Worker assignments: {} workers assigned", assignments.len());
-        for (i, a) in assignments.iter().enumerate() {
-            notice!(
-                "  Worker {}: cluster {} [{}..{}], primary={}",
-                i,
-                a.cluster_id,
-                a.start_idx,
-                a.end_idx,
-                a.is_primary
-            );
-            (*worker_assignments).set_assignment(i, *a);
+        // Use pre-calculated worker distribution from sampling phase
+        notice!("Worker assignments based on sampling:");
+        for (cluster_id, workers) in worker_distribution.iter().enumerate() {
+            if !workers.is_empty() {
+                notice!("  Cluster {}: workers {:?}", cluster_id, workers);
+            }
         }
 
+        // Calculate ranges for each worker based on actual cluster sizes
+        for (cluster_id, workers) in worker_distribution.iter().enumerate() {
+            let cluster_size = final_cluster_sizes.get(cluster_id).copied().unwrap_or(0);
+            if cluster_size == 0 || workers.is_empty() {
+                continue;
+            }
+
+            let workers_for_cluster = workers.len();
+            let chunk_size = (cluster_size + workers_for_cluster - 1) / workers_for_cluster;
+
+            for (i, &worker_id) in workers.iter().enumerate() {
+                let start_idx = i * chunk_size;
+                let end_idx = ((i + 1) * chunk_size).min(cluster_size);
+                let is_primary = i == 0;
+
+                let assignment =
+                    parallel::WorkerAssignment::new(cluster_id, start_idx, end_idx, is_primary);
+                (*worker_assignments).set_assignment(worker_id, assignment);
+
+                notice!(
+                    "  Worker {}: cluster {} [{}..{}], primary={}",
+                    worker_id,
+                    cluster_id,
+                    start_idx,
+                    end_idx,
+                    is_primary
+                );
+            }
+        }
+
+        (*worker_assignments).mark_ready();
         (*parallel_shared)
             .build_state
             .assignments_ready
@@ -699,6 +764,225 @@ unsafe extern "C-unwind" fn build_callback_collect_vectors(
 
 const BATCH_SIZE: usize = 64;
 
+/// Statistics for a single cluster
+#[derive(Debug, Clone)]
+struct ClusterStats {
+    count: usize,
+    sample_vectors: Vec<Vec<f32>>,
+}
+
+impl ClusterStats {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sample_vectors: Vec::new(),
+        }
+    }
+
+    fn add_vector(&mut self, vector: &[f32], max_samples: usize) {
+        self.count += 1;
+        if self.sample_vectors.len() < max_samples {
+            self.sample_vectors.push(vector.to_vec());
+        }
+    }
+}
+
+/// Result of the sampling scan phase
+struct SamplingResult {
+    cluster_stats: Vec<ClusterStats>,
+    total_vectors: usize,
+}
+
+/// Quick sampling scan to determine cluster sizes
+/// This runs before allocating shared memory to properly size the queues
+unsafe fn sampling_scan(
+    heaprel: pg_sys::Relation,
+    indexrel: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    meta_page: &MetaPage,
+    centroids: &[Vec<f32>],
+    sample_rate: f64, // 0.0 - 1.0, fraction of table to sample
+) -> SamplingResult {
+    notice!("Starting sampling scan with rate {:.2}", sample_rate);
+
+    let num_clusters = centroids.len();
+    let mut cluster_stats: Vec<ClusterStats> =
+        (0..num_clusters).map(|_| ClusterStats::new()).collect();
+    let mut total_vectors = 0usize;
+
+    struct SamplingState<'a> {
+        centroids: &'a [Vec<f32>],
+        cluster_stats: &'a mut [ClusterStats],
+        total_vectors: &'a mut usize,
+        meta_page: MetaPage,
+        sample_rate: f64,
+        rng: rand::rngs::SmallRng,
+    }
+
+    #[pg_guard]
+    unsafe extern "C-unwind" fn sampling_callback(
+        _index: pg_sys::Relation,
+        ctid: pg_sys::ItemPointer,
+        values: *mut pg_sys::Datum,
+        isnull: *mut bool,
+        _tuple_is_alive: bool,
+        state: *mut std::os::raw::c_void,
+    ) {
+        let state = &mut *(state as *mut SamplingState);
+
+        if ctid.is_null() {
+            return;
+        }
+
+        // Sample based on rate
+        if state.rng.gen::<f64>() > state.sample_rate {
+            return;
+        }
+
+        let vec = PgVector::from_pg_parts(values, isnull, 0, &state.meta_page, true, false);
+        if let Some(vec) = vec {
+            let vector_slice = vec.to_index_slice();
+            let cluster_id = k_means::k_means_lookup(vector_slice, state.centroids);
+
+            if cluster_id < state.cluster_stats.len() {
+                state.cluster_stats[cluster_id].add_vector(vector_slice, 100);
+            }
+            *state.total_vectors += 1;
+        }
+    }
+
+    let mut state = SamplingState {
+        centroids,
+        cluster_stats: &mut cluster_stats,
+        total_vectors: &mut total_vectors,
+        meta_page: meta_page.clone(),
+        sample_rate,
+        rng: rand::SeedableRng::seed_from_u64(42),
+    };
+
+    pg_sys::IndexBuildHeapScan(
+        heaprel,
+        indexrel,
+        index_info,
+        Some(sampling_callback),
+        &mut state as *mut _ as *mut std::os::raw::c_void,
+    );
+
+    // Scale up counts based on sample rate
+    if sample_rate < 1.0 && sample_rate > 0.0 {
+        let scale_factor = 1.0 / sample_rate;
+        for stats in &mut cluster_stats {
+            stats.count = (stats.count as f64 * scale_factor) as usize;
+        }
+        total_vectors = (total_vectors as f64 * scale_factor) as usize;
+    }
+
+    notice!(
+        "Sampling scan complete: {} vectors estimated",
+        total_vectors
+    );
+    for (i, stats) in cluster_stats.iter().enumerate() {
+        notice!("  Cluster {}: ~{} vectors", i, stats.count);
+    }
+
+    SamplingResult {
+        cluster_stats,
+        total_vectors,
+    }
+}
+
+/// Calculate queue capacity for each cluster based on its size
+fn calculate_queue_capacities(cluster_stats: &[ClusterStats], total_vectors: usize) -> Vec<usize> {
+    let base_capacity = DEFAULT_QUEUE_CAPACITY;
+    let max_capacity = DEFAULT_QUEUE_CAPACITY * 10;
+
+    cluster_stats
+        .iter()
+        .map(|stats| {
+            if total_vectors == 0 {
+                return base_capacity;
+            }
+            // Proportional to cluster size, with minimum and maximum
+            let ratio = stats.count as f64 / total_vectors as f64;
+            let capacity = (base_capacity as f64 * (1.0 + ratio * 5.0)) as usize;
+            capacity.clamp(base_capacity, max_capacity)
+        })
+        .collect()
+}
+
+/// Calculate worker assignments based on cluster sizes
+/// Ensures each cluster gets at least 1 worker if possible
+fn calculate_worker_distribution(
+    cluster_stats: &[ClusterStats],
+    total_workers: usize,
+) -> Vec<Vec<usize>> {
+    let num_clusters = cluster_stats.len();
+    let mut assignments: Vec<Vec<usize>> = cluster_stats.iter().map(|_| Vec::new()).collect();
+
+    // First pass: ensure each cluster gets at least 1 worker
+    let mut worker_id = 0;
+    for cluster_id in 0..num_clusters {
+        if worker_id < total_workers {
+            assignments[cluster_id].push(worker_id);
+            worker_id += 1;
+        }
+    }
+
+    // If we don't have enough workers for all clusters, return what we have
+    if worker_id >= total_workers {
+        return assignments;
+    }
+
+    // Second pass: assign remaining workers proportionally
+    let total_vectors: usize = cluster_stats.iter().map(|s| s.count).sum();
+    if total_vectors > 0 {
+        // Calculate remaining workers to distribute
+        let remaining_workers = total_workers - worker_id;
+
+        // Sort clusters by size (descending) to assign more workers to larger clusters
+        let mut cluster_sizes: Vec<(usize, usize)> = cluster_stats
+            .iter()
+            .enumerate()
+            .map(|(id, stats)| (id, stats.count))
+            .collect();
+        cluster_sizes.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by size descending
+
+        // Distribute remaining workers proportionally
+        for (cluster_id, count) in cluster_sizes {
+            if worker_id >= total_workers {
+                break;
+            }
+
+            let ratio = count as f64 / total_vectors as f64;
+            let extra_workers = (remaining_workers as f64 * ratio).ceil() as usize;
+            let extra_workers = extra_workers.max(1);
+
+            for _ in 0..extra_workers {
+                if worker_id >= total_workers {
+                    break;
+                }
+                assignments[cluster_id].push(worker_id);
+                worker_id += 1;
+            }
+        }
+    }
+
+    // Assign any remaining workers to the largest cluster
+    let largest_cluster = cluster_stats
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, s)| s.count)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    while worker_id < total_workers {
+        assignments[largest_cluster].push(worker_id);
+        worker_id += 1;
+    }
+
+    assignments
+}
+
 struct BatchBuffer {
     cluster_id: usize,
     entries: Vec<(pg_sys::ItemPointerData, Vec<f32>)>,
@@ -737,6 +1021,11 @@ impl ProducerState<'_> {
             return;
         }
 
+        if self.cluster_queues.is_null() {
+            warning!("ProducerState::flush_batch: cluster_queues is null");
+            return;
+        }
+
         let queues = &*self.cluster_queues;
         let base_ptr = self.cluster_queues as *mut u8;
         let cluster_id = self.batch_buffer.cluster_id;
@@ -765,7 +1054,10 @@ impl ProducerState<'_> {
         }
 
         self.batch_buffer.entries.push((heap_tid, vector.to_vec()));
-        (*self.cluster_sizes).increment(cluster_id);
+
+        if !self.cluster_sizes.is_null() {
+            (*self.cluster_sizes).increment(cluster_id);
+        }
     }
 }
 
@@ -843,20 +1135,26 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
     let worker_number = unsafe { pg_sys::ParallelWorkerNumber as usize };
 
-    unsafe {
-        while !(*parallel_shared)
-            .build_state
-            .assignments_ready
-            .load(Ordering::Acquire)
-        {
-            pg_sys::ConditionVariableSleep(
-                &raw mut (*parallel_shared).build_state.assignments_cv as *const _ as *mut _,
-                pg_sys::PG_WAIT_EXTENSION,
-            );
+    // Wait for assignments to be ready
+    if !worker_assignments.is_null() && !parallel_shared.is_null() {
+        unsafe {
+            let build_state = &(*parallel_shared).build_state;
+            let assignments_cv =
+                &raw const build_state.assignments_cv as *mut pg_sys::ConditionVariable;
+
+            // Wait until assignments are ready
+            while !(*worker_assignments).is_ready() {
+                pg_sys::ConditionVariablePrepareToSleep(assignments_cv);
+                if (*worker_assignments).is_ready() {
+                    pg_sys::ConditionVariableCancelSleep();
+                    break;
+                }
+                pg_sys::ConditionVariableSleep(assignments_cv, pg_sys::PG_WAIT_EXTENSION);
+            }
         }
-        pg_sys::ConditionVariableCancelSleep();
     }
 
+    // Get assignment after waiting
     let (cluster_id, start_idx, end_idx, is_primary) = if worker_assignments.is_null() {
         let cluster_id = worker_number;
         if cluster_id >= params.num_clusters {
@@ -868,7 +1166,11 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
         match assignment {
             Some(a) => (a.cluster_id, a.start_idx, a.end_idx, a.is_primary),
             None => {
-                notice!("Worker {} has no assignment, exiting", worker_number);
+                // Worker has no assignment - exit
+                notice!(
+                    "Worker {} has no assignment after waiting, exiting",
+                    worker_number
+                );
                 return;
             }
         }

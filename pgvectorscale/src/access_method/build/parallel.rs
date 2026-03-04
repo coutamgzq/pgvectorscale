@@ -166,6 +166,31 @@ impl ClusterQueues {
         }
     }
 
+    /// Initialize with per-queue capacities
+    /// queue_capacities must have length >= num_queues
+    pub unsafe fn initialize_with_capacities(&self, base_ptr: *mut u8, queue_capacities: &[usize]) {
+        let header_size = std::mem::size_of::<ClusterQueues>();
+        let headers_size = self.num_queues * std::mem::size_of::<ClusterQueueHeader>();
+
+        // Initialize queue headers with individual capacities
+        let headers_ptr = base_ptr.add(header_size) as *mut ClusterQueueHeader;
+        for i in 0..self.num_queues {
+            let header_ptr = headers_ptr.add(i);
+            let capacity = queue_capacities
+                .get(i)
+                .copied()
+                .unwrap_or(self.queue_capacity);
+            *header_ptr = ClusterQueueHeader::new(capacity, self.entry_size);
+        }
+
+        // Initialize condition variables for each queue
+        let cv_ptr = base_ptr.add(header_size + headers_size) as *mut ConditionVariable;
+        for i in 0..self.num_queues {
+            let cv = cv_ptr.add(i);
+            pg_sys::ConditionVariableInit(cv);
+        }
+    }
+
     /// Get pointer to queue headers array
     pub unsafe fn get_headers_ptr(&self, base_ptr: *mut u8) -> *mut ClusterQueueHeader {
         base_ptr.add(std::mem::size_of::<ClusterQueues>()) as *mut ClusterQueueHeader
@@ -187,6 +212,7 @@ impl ClusterQueues {
     }
 
     /// Get pointer to a specific queue entry
+    /// For dynamic capacities, this calculates offset based on actual header capacities
     pub unsafe fn get_entry(
         &self,
         base_ptr: *mut u8,
@@ -194,10 +220,19 @@ impl ClusterQueues {
         index: usize,
     ) -> *mut ClusterQueueEntry {
         let data_ptr = self.get_data_ptr(base_ptr);
-        data_ptr
-            .add(cluster_id * self.entry_size * self.queue_capacity)
-            .add(index * self.entry_size)
-            .cast::<ClusterQueueEntry>()
+
+        // Calculate offset based on actual capacities from headers
+        let headers_ptr = self.get_headers_ptr(base_ptr);
+        let mut offset = 0;
+        for i in 0..cluster_id {
+            let header = &*headers_ptr.add(i);
+            offset += header.capacity * self.entry_size;
+        }
+
+        // Add offset within this cluster's queue
+        offset += index * self.entry_size;
+
+        data_ptr.add(offset).cast::<ClusterQueueEntry>()
     }
 
     /// Get queue header for a specific cluster
