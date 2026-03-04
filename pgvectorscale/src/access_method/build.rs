@@ -312,8 +312,8 @@ pub extern "C-unwind" fn ambuild(
         opt.get_storage_type(),
     );
 
-    let num_clusters = crate::access_method::guc::TSV_NUM_CLUSTERS.get() as usize;
-    let use_clustering = num_clusters > 0;
+    let num_clusters = opt.get_num_clusters() as usize;
+    let use_clustering = num_clusters > 1;
 
     if use_clustering {
         notice!("Using k-means clustering with {} clusters", num_clusters);
@@ -787,7 +787,7 @@ pub fn do_heap_scan_with_clustering(
     }
 
     let storage = meta_page.get_storage_type();
-    let use_clustering = num_clusters > 0 && !centroids.is_empty();
+    let use_clustering = num_clusters > 1 && !centroids.is_empty();
 
     if let Some(parallel_info) = parallel_build_info {
         let shared_state = unsafe { &*parallel_info.parallel_shared };
