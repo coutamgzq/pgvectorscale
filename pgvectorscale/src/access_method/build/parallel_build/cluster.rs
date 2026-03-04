@@ -4,35 +4,36 @@ use pgrx::ffi::c_char;
 use pgrx::pg_sys::{self, pgstat_progress_update_param};
 use pgrx::*;
 
+use crate::access_method::distance;
+use crate::access_method::distance::DistanceType;
+use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
+use crate::access_method::graph::Graph;
 use crate::access_method::k_means;
+use crate::access_method::labels::LabeledVector;
 use crate::access_method::meta_page::MetaPage;
 use crate::access_method::pg_vector::PgVector;
-use crate::access_method::stats::{WriteStats, InsertStats};
-use crate::access_method::storage::StorageType;
-use crate::access_method::labels::LabeledVector;
-use crate::util::ports::PROGRESS_CREATE_IDX_SUBPHASE;
-use crate::access_method::graph::Graph;
-use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
 use crate::access_method::plain::storage::PlainStorage;
 use crate::access_method::sbq::storage::SbqSpeedupStorage;
+use crate::access_method::stats::{InsertStats, WriteStats};
 use crate::access_method::storage::Storage;
-use crate::util::tape::Tape;
+use crate::access_method::storage::StorageType;
 use crate::util::page::PageType;
+use crate::util::ports::PROGRESS_CREATE_IDX_SUBPHASE;
+use crate::util::tape::Tape;
 use crate::util::ItemPointer;
-use crate::access_method::distance::DistanceType;
-use crate::access_method::distance;
 
-use super::super::{
-    ParallelShared, ParallelSharedParams, ParallelBuildState,
-    BUILD_PHASE_COLLECTING_VECTORS, BUILD_PHASE_CLUSTERING, BUILD_PHASE_BUILDING_GRAPH,
-};
 use super::super::parallel::{
-    self, ClusterQueues,
-    ClusterStartNodes, DEFAULT_QUEUE_CAPACITY,
-    SHM_TOC_CLUSTER_QUEUES_KEY, SHM_TOC_CENTROIDS_KEY, SHM_TOC_CLUSTER_START_NODES_KEY,
+    self, ClusterQueues, ClusterSizes, ClusterStartNodes, WorkerAssignment, WorkerAssignments,
+    DEFAULT_QUEUE_CAPACITY, MAX_WORKERS, SHM_TOC_CENTROIDS_KEY, SHM_TOC_CLUSTER_QUEUES_KEY,
+    SHM_TOC_CLUSTER_SIZES_KEY, SHM_TOC_CLUSTER_START_NODES_KEY, SHM_TOC_WORKER_ASSIGNMENTS_KEY,
+};
+use super::super::{
+    ParallelBuildState, ParallelShared, ParallelSharedParams, BUILD_PHASE_BUILDING_GRAPH,
+    BUILD_PHASE_CLUSTERING, BUILD_PHASE_COLLECTING_VECTORS,
 };
 
-const PARALLEL_BUILD_CLUSTER_CONSUMER_MAIN: *const c_char = c"_vectorscale_build_cluster_consumer_main".as_ptr();
+const PARALLEL_BUILD_CLUSTER_CONSUMER_MAIN: *const c_char =
+    c"_vectorscale_build_cluster_consumer_main".as_ptr();
 
 /// RAII guard to ensure ConditionVariableCancelSleep is called on drop.
 /// This is critical to prevent crashes during PostgreSQL's process cleanup.
@@ -73,15 +74,12 @@ pub fn perform_clustering(
     }
 
     let actual_num_clusters = num_clusters.min(vectors.len());
-    let centroids = k_means::k_means(
-        actual_num_clusters,
-        vectors.clone(),
-        false,
-        100,
-        true,
-    );
+    let centroids = k_means::k_means(actual_num_clusters, vectors.clone(), false, 100, true);
 
-    notice!("K-means clustering completed with {} centroids", centroids.len());
+    notice!(
+        "K-means clustering completed with {} centroids",
+        centroids.len()
+    );
 
     let mut cluster_assignments = vec![0usize; vectors.len()];
     for (i, vector) in vectors.iter().enumerate() {
@@ -90,7 +88,10 @@ pub fn perform_clustering(
 
     let cluster_stats: Vec<_> = (0..actual_num_clusters)
         .map(|cluster_id| {
-            let count = cluster_assignments.iter().filter(|&&x| x == cluster_id).count();
+            let count = cluster_assignments
+                .iter()
+                .filter(|&&x| x == cluster_id)
+                .count();
             (cluster_id, count)
         })
         .collect();
@@ -120,7 +121,7 @@ pub fn collect_vectors_for_clustering(
     // to decide whether to use sampling. If sampling is needed, we'll adjust the
     // interval dynamically as we collect vectors.
     let use_sampling = max_sample_size > 0 && sample_threshold > 0;
-    
+
     let collector = VectorCollector {
         vectors: Vec::new(),
         heap_tids: Vec::new(),
@@ -162,7 +163,8 @@ pub fn build_index_with_clustering(
     index_relation: &PgRelation,
 ) -> *mut pg_sys::IndexBuildResult {
     let max_sample_size = crate::access_method::guc::TSV_CLUSTERING_MAX_SAMPLE_SIZE.get() as usize;
-    let sample_threshold = crate::access_method::guc::TSV_CLUSTERING_SAMPLE_THRESHOLD.get() as usize;
+    let sample_threshold =
+        crate::access_method::guc::TSV_CLUSTERING_SAMPLE_THRESHOLD.get() as usize;
 
     let collector = collect_vectors_for_clustering(
         heap_relation,
@@ -176,7 +178,7 @@ pub fn build_index_with_clustering(
     // Sampling is now applied during collection, so use the collected vectors directly
     let vectors_for_clustering = collector.vectors;
     let num_vectors = vectors_for_clustering.len();
-    
+
     if num_vectors > 0 {
         notice!("Collected {} vectors for k-means clustering", num_vectors);
     }
@@ -188,7 +190,8 @@ pub fn build_index_with_clustering(
         );
     }
 
-    let (centroids, _cluster_assignments) = perform_clustering(vectors_for_clustering, num_clusters);
+    let (centroids, _cluster_assignments) =
+        perform_clustering(vectors_for_clustering, num_clusters);
     let actual_num_clusters = centroids.len();
 
     // Save centroids to meta page
@@ -198,7 +201,8 @@ pub fn build_index_with_clustering(
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
     }
 
-    let write_stats = super::super::maybe_train_quantizer(index_info, heap_relation, index_relation, meta_page);
+    let write_stats =
+        super::super::maybe_train_quantizer(index_info, heap_relation, index_relation, meta_page);
     unsafe {
         meta_page.store(index_relation, false);
     };
@@ -269,7 +273,7 @@ fn do_sequential_cluster_build(
     num_clusters: usize,
 ) -> usize {
     notice!("Sequential cluster build with {} clusters", num_clusters);
-    
+
     super::super::do_heap_scan_with_clustering(
         index_info,
         heap_relation,
@@ -309,23 +313,24 @@ fn do_parallel_cluster_build(
 ) -> usize {
     let num_clusters = centroids.len();
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
-    
+
     notice!(
         "Parallel cluster build with {} workers for {} clusters",
-        workers, num_clusters
+        workers,
+        num_clusters
     );
     notice!(
         "Indexing {} vectors with {} dimensions",
-        heap_tuples, num_dimensions
+        heap_tuples,
+        num_dimensions
     );
 
-    // Record start time for statistics
     let start_time = std::time::Instant::now();
 
     unsafe {
         pg_sys::EnterParallelMode();
 
-        let num_workers = num_clusters;
+        let num_workers = workers.min(MAX_WORKERS).max(num_clusters);
         let pcxt = pg_sys::CreateParallelContext(
             crate::EXTENSION_NAME,
             PARALLEL_BUILD_CLUSTER_CONSUMER_MAIN,
@@ -340,16 +345,23 @@ fn do_parallel_cluster_build(
 
         parallel::toc_estimate_single_chunk(pcxt, std::mem::size_of::<ParallelShared>());
 
-        // ClusterQueues structure + queue data storage (contiguous)
-        let cluster_queues_size = ClusterQueues::calculate_size(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        let cluster_queues_size =
+            ClusterQueues::calculate_size(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
         parallel::toc_estimate_single_chunk(pcxt, cluster_queues_size);
 
         let centroids_size = std::mem::size_of::<usize>()
-            + num_clusters * (std::mem::size_of::<usize>() + num_dimensions * std::mem::size_of::<f32>());
+            + num_clusters
+                * (std::mem::size_of::<usize>() + num_dimensions * std::mem::size_of::<f32>());
         parallel::toc_estimate_single_chunk(pcxt, centroids_size);
 
         let start_nodes_size = std::mem::size_of::<ClusterStartNodes>();
         parallel::toc_estimate_single_chunk(pcxt, start_nodes_size);
+
+        let cluster_sizes_size = std::mem::size_of::<ClusterSizes>();
+        parallel::toc_estimate_single_chunk(pcxt, cluster_sizes_size);
+
+        let worker_assignments_size = std::mem::size_of::<WorkerAssignments>();
+        parallel::toc_estimate_single_chunk(pcxt, worker_assignments_size);
 
         pg_sys::InitializeParallelDSM(pcxt);
 
@@ -371,11 +383,9 @@ fn do_parallel_cluster_build(
             );
         }
 
-        let parallel_shared = pg_sys::shm_toc_allocate(
-            (*pcxt).toc,
-            std::mem::size_of::<ParallelShared>(),
-        )
-        .cast::<ParallelShared>();
+        let parallel_shared =
+            pg_sys::shm_toc_allocate((*pcxt).toc, std::mem::size_of::<ParallelShared>())
+                .cast::<ParallelShared>();
 
         let heap_tuples = heap_relation.rd_rel.as_ref().unwrap().reltuples as usize;
         let shared_state = ParallelShared {
@@ -393,37 +403,39 @@ fn do_parallel_cluster_build(
                 consumers_finished: AtomicUsize::new(0),
                 start_nodes_initialized: AtomicBool::new(false),
                 initialization_cv: std::mem::zeroed(),
+                assignments_ready: AtomicBool::new(false),
+                assignments_cv: std::mem::zeroed(),
             },
             meta_page_ptr: std::ptr::null_mut(),
         };
         parallel_shared.write(shared_state);
 
         pg_sys::ConditionVariableInit(&raw mut (*parallel_shared).build_state.initialization_cv);
+        pg_sys::ConditionVariableInit(&raw mut (*parallel_shared).build_state.assignments_cv);
 
-        // Allocate cluster queues structure + data (contiguous)
-        let cluster_queues = pg_sys::shm_toc_allocate(
-            (*pcxt).toc,
-            cluster_queues_size,
-        )
-        .cast::<ClusterQueues>();
-        
+        let cluster_queues =
+            pg_sys::shm_toc_allocate((*pcxt).toc, cluster_queues_size).cast::<ClusterQueues>();
+
         // Initialize ClusterQueues in allocated memory
-        let queues_template = ClusterQueues::new(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
+        let queues_template =
+            ClusterQueues::new(num_clusters, DEFAULT_QUEUE_CAPACITY, num_dimensions);
         std::ptr::write(cluster_queues, queues_template);
         (*cluster_queues).initialize(cluster_queues as *mut u8);
 
-        let centroids_ptr = pg_sys::shm_toc_allocate(
-            (*pcxt).toc,
-            centroids_size,
-        ).cast::<u8>();
+        let centroids_ptr = pg_sys::shm_toc_allocate((*pcxt).toc, centroids_size).cast::<u8>();
         write_centroids_to_shmem(centroids_ptr, centroids, num_dimensions);
 
-        let cluster_start_nodes = pg_sys::shm_toc_allocate(
-            (*pcxt).toc,
-            start_nodes_size,
-        )
-        .cast::<ClusterStartNodes>();
+        let cluster_start_nodes =
+            pg_sys::shm_toc_allocate((*pcxt).toc, start_nodes_size).cast::<ClusterStartNodes>();
         (*cluster_start_nodes) = ClusterStartNodes::new(num_clusters);
+
+        let cluster_sizes =
+            pg_sys::shm_toc_allocate((*pcxt).toc, cluster_sizes_size).cast::<ClusterSizes>();
+        std::ptr::write(cluster_sizes, ClusterSizes::new(num_clusters));
+
+        let worker_assignments = pg_sys::shm_toc_allocate((*pcxt).toc, worker_assignments_size)
+            .cast::<WorkerAssignments>();
+        std::ptr::write(worker_assignments, WorkerAssignments::new());
 
         pg_sys::shm_toc_insert(
             (*pcxt).toc,
@@ -435,15 +447,17 @@ fn do_parallel_cluster_build(
             SHM_TOC_CLUSTER_QUEUES_KEY,
             cluster_queues.cast(),
         );
-        pg_sys::shm_toc_insert(
-            (*pcxt).toc,
-            SHM_TOC_CENTROIDS_KEY,
-            centroids_ptr.cast(),
-        );
+        pg_sys::shm_toc_insert((*pcxt).toc, SHM_TOC_CENTROIDS_KEY, centroids_ptr.cast());
         pg_sys::shm_toc_insert(
             (*pcxt).toc,
             SHM_TOC_CLUSTER_START_NODES_KEY,
             cluster_start_nodes.cast(),
+        );
+        pg_sys::shm_toc_insert((*pcxt).toc, SHM_TOC_CLUSTER_SIZES_KEY, cluster_sizes.cast());
+        pg_sys::shm_toc_insert(
+            (*pcxt).toc,
+            SHM_TOC_WORKER_ASSIGNMENTS_KEY,
+            worker_assignments.cast(),
         );
 
         pg_sys::LaunchParallelWorkers(pcxt);
@@ -474,9 +488,11 @@ fn do_parallel_cluster_build(
         let mut producer_state = ProducerState {
             _parallel_shared: parallel_shared,
             cluster_queues,
+            cluster_sizes,
             centroids: &centroids,
             ntuples: 0,
             meta_page: meta_page.clone(),
+            batch_buffer: BatchBuffer::new(),
         };
 
         pg_sys::IndexBuildHeapScan(
@@ -486,6 +502,8 @@ fn do_parallel_cluster_build(
             Some(producer_callback),
             &mut producer_state as *mut _ as *mut std::os::raw::c_void,
         );
+
+        producer_state.flush_batch();
 
         (*parallel_shared)
             .build_state
@@ -502,6 +520,31 @@ fn do_parallel_cluster_build(
             .build_state
             .producer_ntuples
             .store(producer_state.ntuples, Ordering::Relaxed);
+
+        let final_cluster_sizes = (*cluster_sizes).get_all();
+        notice!("Cluster sizes after scan: {:?}", final_cluster_sizes);
+
+        let assignments = parallel::calculate_worker_assignments(&final_cluster_sizes, launched);
+        notice!("Worker assignments: {} workers assigned", assignments.len());
+        for (i, a) in assignments.iter().enumerate() {
+            notice!(
+                "  Worker {}: cluster {} [{}..{}], primary={}",
+                i,
+                a.cluster_id,
+                a.start_idx,
+                a.end_idx,
+                a.is_primary
+            );
+            (*worker_assignments).set_assignment(i, *a);
+        }
+
+        (*parallel_shared)
+            .build_state
+            .assignments_ready
+            .store(true, Ordering::Release);
+        pg_sys::ConditionVariableBroadcast(
+            &raw mut (*parallel_shared).build_state.assignments_cv as *const _ as *mut _,
+        );
 
         pg_sys::WaitForParallelWorkersToFinish(pcxt);
 
@@ -530,21 +573,14 @@ fn do_parallel_cluster_build(
             "  - Queue capacity: {} entries per cluster",
             DEFAULT_QUEUE_CAPACITY
         );
-        notice!(
-            "  - Total shared memory: {} bytes",
-            cluster_queues_size
-        );
+        notice!("  - Total shared memory: {} bytes", cluster_queues_size);
 
         parallel::cleanup_parallel_context(pcxt, snapshot);
         ntuples
     }
 }
 
-unsafe fn write_centroids_to_shmem(
-    ptr: *mut u8,
-    centroids: &[Vec<f32>],
-    num_dimensions: usize,
-) {
+unsafe fn write_centroids_to_shmem(ptr: *mut u8, centroids: &[Vec<f32>], num_dimensions: usize) {
     let num_clusters = centroids.len();
     let num_clusters_ptr = ptr as *mut usize;
     std::ptr::write(num_clusters_ptr, num_clusters);
@@ -561,9 +597,7 @@ unsafe fn write_centroids_to_shmem(
     }
 }
 
-unsafe fn read_centroids_from_shmem(
-    ptr: *const u8,
-) -> Vec<Vec<f32>> {
+unsafe fn read_centroids_from_shmem(ptr: *const u8) -> Vec<Vec<f32>> {
     let num_clusters_ptr = ptr as *const usize;
     let num_clusters = std::ptr::read(num_clusters_ptr);
 
@@ -617,37 +651,122 @@ unsafe extern "C-unwind" fn build_callback_collect_vectors(
     }
 
     let collector_with_meta = (state as *mut VectorCollectorWithMeta).as_mut().unwrap();
-    let vec = PgVector::from_pg_parts(values, isnull, 0, collector_with_meta.meta_page, true, false);
+    let vec = PgVector::from_pg_parts(
+        values,
+        isnull,
+        0,
+        collector_with_meta.meta_page,
+        true,
+        false,
+    );
     if let Some(vec) = vec {
         collector_with_meta.collector.total_vectors_seen += 1;
 
         if collector_with_meta.collector.use_sampling {
-            if collector_with_meta.collector.vectors.len() >= collector_with_meta.collector.max_sample_size {
+            if collector_with_meta.collector.vectors.len()
+                >= collector_with_meta.collector.max_sample_size
+            {
                 return;
             }
 
             if collector_with_meta.collector.sample_interval > 1 {
-                if collector_with_meta.collector.total_vectors_seen % collector_with_meta.collector.sample_interval == 0 {
-                    collector_with_meta.collector.vectors.push(vec.to_index_slice().to_vec());
+                if collector_with_meta.collector.total_vectors_seen
+                    % collector_with_meta.collector.sample_interval
+                    == 0
+                {
+                    collector_with_meta
+                        .collector
+                        .vectors
+                        .push(vec.to_index_slice().to_vec());
                     collector_with_meta.collector.heap_tids.push(*ctid);
                 }
             } else {
-                collector_with_meta.collector.vectors.push(vec.to_index_slice().to_vec());
+                collector_with_meta
+                    .collector
+                    .vectors
+                    .push(vec.to_index_slice().to_vec());
                 collector_with_meta.collector.heap_tids.push(*ctid);
             }
         } else {
-            collector_with_meta.collector.vectors.push(vec.to_index_slice().to_vec());
+            collector_with_meta
+                .collector
+                .vectors
+                .push(vec.to_index_slice().to_vec());
             collector_with_meta.collector.heap_tids.push(*ctid);
         }
+    }
+}
+
+const BATCH_SIZE: usize = 64;
+
+struct BatchBuffer {
+    cluster_id: usize,
+    entries: Vec<(pg_sys::ItemPointerData, Vec<f32>)>,
+}
+
+impl BatchBuffer {
+    fn new() -> Self {
+        Self {
+            cluster_id: 0,
+            entries: Vec::with_capacity(BATCH_SIZE),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.entries.len() >= BATCH_SIZE
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 
 struct ProducerState<'a> {
     _parallel_shared: *mut ParallelShared,
     cluster_queues: *mut ClusterQueues,
+    cluster_sizes: *mut ClusterSizes,
     centroids: &'a [Vec<f32>],
     ntuples: usize,
     meta_page: MetaPage,
+    batch_buffer: BatchBuffer,
+}
+
+impl ProducerState<'_> {
+    unsafe fn flush_batch(&mut self) {
+        if self.batch_buffer.entries.is_empty() {
+            return;
+        }
+
+        let queues = &*self.cluster_queues;
+        let base_ptr = self.cluster_queues as *mut u8;
+        let cluster_id = self.batch_buffer.cluster_id;
+
+        let entries: Vec<(pg_sys::ItemPointerData, &[f32])> = self
+            .batch_buffer
+            .entries
+            .iter()
+            .map(|(tid, vec)| (*tid, vec.as_slice()))
+            .collect();
+
+        let pushed = queues.push_batch_to_queue(base_ptr, cluster_id, &entries);
+        self.ntuples += pushed;
+        self.batch_buffer.clear();
+    }
+
+    unsafe fn push_with_batch(
+        &mut self,
+        cluster_id: usize,
+        heap_tid: pg_sys::ItemPointerData,
+        vector: &[f32],
+    ) {
+        if self.batch_buffer.cluster_id != cluster_id || self.batch_buffer.is_full() {
+            self.flush_batch();
+            self.batch_buffer.cluster_id = cluster_id;
+        }
+
+        self.batch_buffer.entries.push((heap_tid, vector.to_vec()));
+        (*self.cluster_sizes).increment(cluster_id);
+    }
 }
 
 #[pg_guard]
@@ -660,22 +779,17 @@ unsafe extern "C-unwind" fn producer_callback(
     state: *mut std::os::raw::c_void,
 ) {
     let producer_state = &mut *(state as *mut ProducerState);
-    
-    // Check if ctid is valid before dereferencing
+
     if ctid.is_null() {
         return;
     }
-    
+
     let vec = PgVector::from_pg_parts(values, isnull, 0, &producer_state.meta_page, true, false);
     if let Some(vec) = vec {
         let vector_slice = vec.to_index_slice();
         let cluster_id = k_means::k_means_lookup(vector_slice, producer_state.centroids);
-        
-        let queues = &*producer_state.cluster_queues;
-        let base_ptr = producer_state.cluster_queues as *mut u8;
-        queues.push_to_queue(base_ptr, cluster_id, *ctid, vector_slice);
-        
-        producer_state.ntuples += 1;
+
+        producer_state.push_with_batch(cluster_id, *ctid, vector_slice);
     }
 }
 
@@ -689,7 +803,7 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
     if shm_toc.is_null() {
         return;
     }
-    
+
     let parallel_shared: *mut ParallelShared = unsafe {
         pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_SHARED_KEY, false)
             .cast::<ParallelShared>()
@@ -697,23 +811,20 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
     if parallel_shared.is_null() {
         return;
     }
-    
+
     let cluster_queues: *mut ClusterQueues = unsafe {
-        pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_CLUSTER_QUEUES_KEY, false)
-            .cast::<ClusterQueues>()
+        pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_CLUSTER_QUEUES_KEY, false).cast::<ClusterQueues>()
     };
     if cluster_queues.is_null() {
         return;
     }
-    
-    let centroids_ptr: *const u8 = unsafe {
-        pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_CENTROIDS_KEY, false)
-            .cast::<u8>()
-    };
+
+    let centroids_ptr: *const u8 =
+        unsafe { pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_CENTROIDS_KEY, false).cast::<u8>() };
     if centroids_ptr.is_null() {
         return;
     }
-    
+
     let cluster_start_nodes: *mut ClusterStartNodes = unsafe {
         pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_CLUSTER_START_NODES_KEY, false)
             .cast::<ClusterStartNodes>()
@@ -722,31 +833,89 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
         return;
     }
 
+    let worker_assignments: *mut WorkerAssignments = unsafe {
+        pg_sys::shm_toc_lookup(shm_toc, SHM_TOC_WORKER_ASSIGNMENTS_KEY, false)
+            .cast::<WorkerAssignments>()
+    };
+
     let params = unsafe { (*parallel_shared).params };
     let centroids = unsafe { read_centroids_from_shmem(centroids_ptr) };
 
     let worker_number = unsafe { pg_sys::ParallelWorkerNumber as usize };
-    let cluster_id = worker_number;
 
-    if cluster_id >= params.num_clusters {
-        return;
+    unsafe {
+        while !(*parallel_shared)
+            .build_state
+            .assignments_ready
+            .load(Ordering::Acquire)
+        {
+            pg_sys::ConditionVariableSleep(
+                &raw mut (*parallel_shared).build_state.assignments_cv as *const _ as *mut _,
+                pg_sys::PG_WAIT_EXTENSION,
+            );
+        }
+        pg_sys::ConditionVariableCancelSleep();
     }
 
-    notice!("Consumer worker {} starting for cluster {}", worker_number, cluster_id);
-    
+    let (cluster_id, start_idx, end_idx, is_primary) = if worker_assignments.is_null() {
+        let cluster_id = worker_number;
+        if cluster_id >= params.num_clusters {
+            return;
+        }
+        (cluster_id, 0, usize::MAX, true)
+    } else {
+        let assignment = unsafe { (*worker_assignments).get_assignment(worker_number) };
+        match assignment {
+            Some(a) => (a.cluster_id, a.start_idx, a.end_idx, a.is_primary),
+            None => {
+                notice!("Worker {} has no assignment, exiting", worker_number);
+                return;
+            }
+        }
+    };
+
+    notice!(
+        "Consumer worker {} starting for cluster {} [{}..{}], primary={}",
+        worker_number,
+        cluster_id,
+        start_idx,
+        end_idx,
+        is_primary
+    );
+
     // Debug: Check cluster_queues pointer and queue data
     unsafe {
-        notice!("Consumer {}: cluster_queues ptr = {:?}", worker_number, cluster_queues);
-        notice!("Consumer {}: num_queues = {}", worker_number, (*cluster_queues).num_queues);
-        notice!("Consumer {}: entry_size = {}", worker_number, (*cluster_queues).entry_size);
-        notice!("Consumer {}: queue_capacity = {}", worker_number, (*cluster_queues).queue_capacity);
-        
+        notice!(
+            "Consumer {}: cluster_queues ptr = {:?}",
+            worker_number,
+            cluster_queues
+        );
+        notice!(
+            "Consumer {}: num_queues = {}",
+            worker_number,
+            (*cluster_queues).num_queues
+        );
+        notice!(
+            "Consumer {}: entry_size = {}",
+            worker_number,
+            (*cluster_queues).entry_size
+        );
+        notice!(
+            "Consumer {}: queue_capacity = {}",
+            worker_number,
+            (*cluster_queues).queue_capacity
+        );
+
         // Check queue header for this cluster
         let base_ptr = cluster_queues as *mut u8;
         let header = (*cluster_queues).get_header(base_ptr, cluster_id);
-        notice!("Consumer {}: header head={}, tail={}, capacity={}", 
-                worker_number, (*header).head.load(Ordering::Acquire), 
-                (*header).tail.load(Ordering::Acquire), (*header).capacity);
+        notice!(
+            "Consumer {}: header head={}, tail={}, capacity={}",
+            worker_number,
+            (*header).head.load(Ordering::Acquire),
+            (*header).tail.load(Ordering::Acquire),
+            (*header).capacity
+        );
     }
 
     let (heap_lockmode, index_lockmode) = if params.is_concurrent {
@@ -776,6 +945,9 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
         let mut consumer_state = ConsumerState {
             cluster_id,
+            start_idx,
+            end_idx,
+            is_primary,
             cluster_queues,
             _parallel_shared: parallel_shared,
             _num_dimensions: params.num_dimensions,
@@ -791,10 +963,12 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
             &centroids,
         );
 
-        if let Some(first_node) = consumer_state.first_node {
-            let mut item_pointer_data = pg_sys::ItemPointerData::default();
-            first_node.to_item_pointer_data(&mut item_pointer_data);
-            (*cluster_start_nodes).set_start_node(cluster_id, item_pointer_data);
+        if is_primary {
+            if let Some(first_node) = consumer_state.first_node {
+                let mut item_pointer_data = pg_sys::ItemPointerData::default();
+                first_node.to_item_pointer_data(&mut item_pointer_data);
+                (*cluster_start_nodes).set_start_node(cluster_id, item_pointer_data);
+            }
         }
 
         (*parallel_shared)
@@ -812,6 +986,9 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
 struct ConsumerState {
     cluster_id: usize,
+    start_idx: usize,
+    end_idx: usize,
+    is_primary: bool,
     cluster_queues: *mut ClusterQueues,
     _parallel_shared: *mut ParallelShared,
     _num_dimensions: usize,
@@ -835,54 +1012,84 @@ unsafe fn process_cluster_vectors<S: Storage>(
     write_stats: &mut WriteStats,
 ) {
     let mut insert_stats = InsertStats::default();
+    let mut queue_idx: usize = 0;
+    let start_idx = consumer_state.start_idx;
+    let end_idx = consumer_state.end_idx;
+    let num_dimensions = meta_page.get_num_dimensions_to_index() as usize;
+
+    let mut batch_heap_tids: Vec<pg_sys::ItemPointerData> = vec![std::mem::zeroed(); BATCH_SIZE];
+    let mut batch_vectors: Vec<Vec<f32>> = (0..BATCH_SIZE)
+        .map(|_| vec![0.0f32; num_dimensions])
+        .collect();
 
     loop {
-        if let Some((heap_tid, vector_data)) = queues.pop_from_queue(base_ptr, cluster_id) {
-            let heap_pointer = ItemPointer::new(
-                pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid),
-                pgrx::itemptr::item_pointer_get_offset_number_no_check(heap_tid),
+        let available = queues.queue_size(base_ptr, cluster_id);
+        let batch_count = available.min(BATCH_SIZE);
+
+        if batch_count > 0 {
+            let popped = queues.pop_batch_from_queue(
+                base_ptr,
+                cluster_id,
+                batch_count,
+                &mut batch_heap_tids,
+                &mut batch_vectors,
             );
 
-            let distance_type = meta_page.get_distance_type();
-            let vector_slice: Vec<f32> = match distance_type {
-                DistanceType::Cosine => {
-                    let mut normalized = vector_data.to_vec();
-                    distance::preprocess_cosine(&mut normalized);
-                    normalized
+            for i in 0..popped {
+                if queue_idx < start_idx {
+                    queue_idx += 1;
+                    continue;
                 }
-                _ => vector_data.to_vec(),
-            };
+                if queue_idx >= end_idx {
+                    break;
+                }
+                queue_idx += 1;
 
-            let index_pointer = storage.create_node(
-                &vector_slice,
-                None,
-                heap_pointer,
-                meta_page,
-                tape,
-                write_stats,
-            );
+                let heap_tid = batch_heap_tids[i];
+                let vector_data = &batch_vectors[i];
 
-            let labeled_vector = LabeledVector::new(
-                PgVector::from_slice(&vector_data),
-                None,
-            );
-            graph.insert(
-                index_relation,
-                index_pointer,
-                labeled_vector,
-                storage,
-                &mut insert_stats,
-            );
+                let heap_pointer = ItemPointer::new(
+                    pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid),
+                    pgrx::itemptr::item_pointer_get_offset_number_no_check(heap_tid),
+                );
 
-            if consumer_state.first_node.is_none() {
-                consumer_state.first_node = Some(index_pointer);
-            }
+                let distance_type = meta_page.get_distance_type();
+                let vector_slice: Vec<f32> = match distance_type {
+                    DistanceType::Cosine => {
+                        let mut normalized = vector_data.to_vec();
+                        distance::preprocess_cosine(&mut normalized);
+                        normalized
+                    }
+                    _ => vector_data.to_vec(),
+                };
 
-            consumer_state.ntuples += 1;
+                let index_pointer = storage.create_node(
+                    &vector_slice,
+                    None,
+                    heap_pointer,
+                    meta_page,
+                    tape,
+                    write_stats,
+                );
 
-            // Periodically flush neighbor cache to reduce disk I/O
-            if consumer_state.ntuples % flush_interval == 0 {
-                graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+                let labeled_vector = LabeledVector::new(PgVector::from_slice(vector_data), None);
+                graph.insert(
+                    index_relation,
+                    index_pointer,
+                    labeled_vector,
+                    storage,
+                    &mut insert_stats,
+                );
+
+                if consumer_state.first_node.is_none() {
+                    consumer_state.first_node = Some(index_pointer);
+                }
+
+                consumer_state.ntuples += 1;
+
+                if consumer_state.ntuples % flush_interval == 0 {
+                    graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+                }
             }
         } else if queues.is_queue_finished(base_ptr, cluster_id) {
             break;
@@ -891,7 +1098,6 @@ unsafe fn process_cluster_vectors<S: Storage>(
         }
     }
 
-    // Final flush after all vectors are processed
     graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
 }
 
@@ -929,11 +1135,8 @@ unsafe fn build_cluster_subgraph(
 
     match storage_type {
         StorageType::Plain => {
-            let mut plain = PlainStorage::new_for_build(
-                index_relation,
-                heap_relation,
-                graph.get_meta_page(),
-            );
+            let mut plain =
+                PlainStorage::new_for_build(index_relation, heap_relation, graph.get_meta_page());
 
             process_cluster_vectors(
                 consumer_state,
@@ -975,5 +1178,9 @@ unsafe fn build_cluster_subgraph(
         }
     }
 
-    notice!("Consumer for cluster {} processed {} vectors", cluster_id, consumer_state.ntuples);
+    notice!(
+        "Consumer for cluster {} processed {} vectors",
+        cluster_id,
+        consumer_state.ntuples
+    );
 }
