@@ -83,7 +83,7 @@ pub struct ListSearchResult<QDM, PD> {
 }
 
 impl<QDM, PD> ListSearchResult<QDM, PD> {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             candidates: BinaryHeap::new(),
             visited: vec![],
@@ -95,7 +95,11 @@ impl<QDM, PD> ListSearchResult<QDM, PD> {
         }
     }
 
-    fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty() && self.visited.is_empty()
+    }
+
+    pub fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
         start_nodes: Vec<ItemPointer>,
         sdm: S::QueryDistanceMeasure,
         tie_break_item_pointer: Option<ItemPointer>,
@@ -182,6 +186,20 @@ impl<QDM, PD> ListSearchResult<QDM, PD> {
         let lsn = self.visited.remove(0);
         let heap_pointer = storage.return_lsn(&lsn, &mut self.stats);
         Some((heap_pointer, lsn.index_pointer))
+    }
+
+    /// Consumes and returns the first element with its distance.
+    pub fn consume_with_distance<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+        &mut self,
+        storage: &S,
+    ) -> Option<(HeapPointer, IndexPointer, f32)> {
+        if self.visited.is_empty() {
+            return None;
+        }
+        let lsn = self.visited.remove(0);
+        let distance = lsn.distance_with_tie_break.get_distance();
+        let heap_pointer = storage.return_lsn(&lsn, &mut self.stats);
+        Some((heap_pointer, lsn.index_pointer, distance))
     }
 }
 
