@@ -18,11 +18,13 @@ pub struct TSVIndexOptions {
     pub num_dimensions: u32,
     pub max_alpha: f64,
     pub bq_num_bits_per_dimension: u32,
+    pub num_clusters: i32,
 }
 
 pub const NUM_NEIGHBORS_DEFAULT_SENTINEL: i32 = -1;
 pub const NUM_DIMENSIONS_DEFAULT_SENTINEL: u32 = 0;
 pub const SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL: u32 = 0;
+pub const NUM_CLUSTERS_DEFAULT_SENTINEL: i32 = -1;
 const DEFAULT_MAX_ALPHA: f64 = 1.2;
 
 impl TSVIndexOptions {
@@ -40,6 +42,7 @@ impl TSVIndexOptions {
             ops.max_alpha = DEFAULT_MAX_ALPHA;
             ops.num_dimensions = NUM_DIMENSIONS_DEFAULT_SENTINEL;
             ops.bq_num_bits_per_dimension = SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL;
+            ops.num_clusters = NUM_CLUSTERS_DEFAULT_SENTINEL;
             unsafe {
                 set_varsize_4b(
                     ops.as_ptr().cast(),
@@ -71,6 +74,17 @@ impl TSVIndexOptions {
         });
 
         StorageType::from_str(s.as_str())
+    }
+
+    pub fn get_num_clusters(&self) -> i32 {
+        if self.num_clusters == NUM_CLUSTERS_DEFAULT_SENTINEL {
+            NUM_CLUSTERS_DEFAULT_SENTINEL
+        } else {
+            if self.num_clusters < 1 {
+                panic!("num_clusters must be greater than 0, or -1 for default")
+            }
+            self.num_clusters
+        }
     }
 
     fn get_str<F: FnOnce() -> String>(&self, offset: i32, default: F) -> String {
@@ -128,7 +142,7 @@ pub unsafe extern "C-unwind" fn amoptions(
             }
         }
     }
-    let tab: [pg_sys::relopt_parse_elt; 6] = [
+    let tab: [pg_sys::relopt_parse_elt; 7] = [
         make_relopt_parse_elt(
             "storage_layout",
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
@@ -158,6 +172,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             "max_alpha",
             pg_sys::relopt_type::RELOPT_TYPE_REAL,
             offset_of!(TSVIndexOptions, max_alpha) as i32,
+        ),
+        make_relopt_parse_elt(
+            "num_clusters",
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            offset_of!(TSVIndexOptions, num_clusters) as i32,
         ),
     ];
 
@@ -257,6 +276,16 @@ pub unsafe fn init() {
         SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL as _,
         0,
         32,
+        pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
+    );
+
+    pg_sys::add_int_reloption(
+        RELOPT_KIND_TSV,
+        "num_clusters".as_pg_cstr(),
+        "Number of clusters for k-means clustering (-1 to disable)".as_pg_cstr(),
+        NUM_CLUSTERS_DEFAULT_SENTINEL,
+        -1,
+        100,
         pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE,
     );
 }

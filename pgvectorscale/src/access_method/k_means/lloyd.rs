@@ -2,6 +2,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
+use super::squared_distance;
+
 const DELTA: f32 = 1e-6;
 
 pub struct LloydKMeans {
@@ -15,7 +17,12 @@ pub struct LloydKMeans {
 }
 
 impl LloydKMeans {
-    pub fn new(c: usize, samples: Vec<Vec<f32>>, is_spherical: bool, prefer_kmeanspp: bool) -> Self {
+    pub fn new(
+        c: usize,
+        samples: Vec<Vec<f32>>,
+        is_spherical: bool,
+        prefer_kmeanspp: bool,
+    ) -> Self {
         let n = samples.len();
         let dims = if n > 0 { samples[0].len() } else { 0 };
 
@@ -49,7 +56,9 @@ impl LloydKMeans {
                 centroids.push(samples[index].clone());
             }
         } else {
-            let indices: Vec<usize> = rand::seq::index::sample(&mut rng, n, c).into_iter().collect();
+            let indices: Vec<usize> = rand::seq::index::sample(&mut rng, n, c)
+                .into_iter()
+                .collect();
             for index in indices {
                 centroids.push(samples[index].clone());
             }
@@ -171,13 +180,6 @@ impl LloydKMeans {
     pub fn finish(self) -> Vec<Vec<f32>> {
         self.centroids
     }
-}
-
-fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum()
 }
 
 fn vector_norm(a: &[f32]) -> f32 {
