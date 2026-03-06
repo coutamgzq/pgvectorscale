@@ -1259,6 +1259,19 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
         // We don't share MetaPage because it contains heap-allocated fields (BTreeMap, Vec)
         let mut meta_page = MetaPage::fetch(&index_relation);
 
+        // Calculate workers per cluster for correct cache sizing and flush interval
+        let workers_per_cluster = if worker_assignments.is_null() {
+            1
+        } else {
+            (*worker_assignments).count_workers_for_cluster(cluster_id)
+        };
+        log!(
+            "Worker {}: cluster {} has {} workers",
+            worker_number,
+            cluster_id,
+            workers_per_cluster
+        );
+
         let mut consumer_state = ConsumerState {
             cluster_id,
             start_idx,
@@ -1270,6 +1283,7 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
             ntuples: 0,
             first_node: None,
             worker_number,
+            workers_per_cluster,
         };
 
         build_cluster_subgraph(
@@ -1308,6 +1322,7 @@ struct ConsumerState {
     ntuples: usize,
     first_node: Option<crate::util::ItemPointer>,
     worker_number: usize,
+    workers_per_cluster: usize,
 }
 
 /// Process vectors from queue and build graph for a single cluster.
@@ -1474,12 +1489,14 @@ unsafe fn build_cluster_subgraph(
     let storage_type = meta_page.get_storage_type();
     const BUILDER_NEIGHBOR_CACHE_SIZE: f64 = 0.8;
 
+    // Use correct workers_per_cluster for cache sizing
+    let workers_per_cluster = consumer_state.workers_per_cluster;
     let mut graph = unsafe {
         Graph::new(
             GraphNeighborStore::Builder(BuilderNeighborCache::new(
                 BUILDER_NEIGHBOR_CACHE_SIZE,
                 meta_page,
-                1,
+                workers_per_cluster,
             )),
             &mut *(meta_page as *mut _),
         )
@@ -1488,9 +1505,31 @@ unsafe fn build_cluster_subgraph(
     let mut tape = unsafe { Tape::new(index_relation, PageType::Node) };
     let mut write_stats = WriteStats::default();
 
-    // Get total vectors from parallel shared state for flush interval calculation
+    // Calculate flush interval based on cluster size and number of workers per cluster
+    // This ensures more frequent synchronization for multi-worker clusters
     let total_vectors = unsafe { (*consumer_state._parallel_shared).params.total_vectors };
-    let flush_interval = parallel::flush_rate(total_vectors);
+    let num_clusters = unsafe { (*consumer_state._parallel_shared).params.num_clusters as usize };
+    
+    // Estimate vectors per cluster (total / num_clusters)
+    let cluster_vectors = total_vectors / num_clusters.max(1);
+    
+    // Adjust flush interval: divide by workers_per_cluster to ensure more frequent flushes
+    // when multiple workers are building the same cluster
+    let base_flush_interval = parallel::flush_rate(cluster_vectors.max(1));
+    let flush_interval = if workers_per_cluster > 1 {
+        // More frequent flushes when multiple workers share a cluster
+        (base_flush_interval / workers_per_cluster).max(100)
+    } else {
+        base_flush_interval
+    };
+    
+    log!(
+        "Cluster {}: workers={}, cluster_vectors={}, flush_interval={}",
+        cluster_id,
+        workers_per_cluster,
+        cluster_vectors,
+        flush_interval
+    );
 
     match storage_type {
         StorageType::Plain => {

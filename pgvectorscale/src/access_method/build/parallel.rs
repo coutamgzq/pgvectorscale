@@ -651,7 +651,7 @@ impl ClusterStartNodes {
 }
 
 /// Default capacity for each queue
-pub const DEFAULT_QUEUE_CAPACITY: usize = 10240;
+pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 /// Maximum number of workers supported
 pub const MAX_WORKERS: usize = 64;
@@ -719,6 +719,20 @@ impl WorkerAssignments {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// Count the number of workers assigned to a specific cluster
+    pub fn count_workers_for_cluster(&self, cluster_id: usize) -> usize {
+        let count = self.num_assignments.load(Ordering::Acquire);
+        let mut workers_for_cluster = 0;
+        for i in 0..count {
+            if let Some(assignment) = self.get_assignment(i) {
+                if assignment.cluster_id == cluster_id {
+                    workers_for_cluster += 1;
+                }
+            }
+        }
+        workers_for_cluster.max(1) // At least 1 worker
     }
 }
 
