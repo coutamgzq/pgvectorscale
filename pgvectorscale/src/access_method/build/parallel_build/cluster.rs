@@ -834,8 +834,6 @@ unsafe fn process_cluster_vectors<S: Storage>(
     tape: &mut Tape,
     write_stats: &mut WriteStats,
 ) {
-    let mut insert_stats = InsertStats::default();
-
     loop {
         if let Some((heap_tid, vector_data)) = queues.pop_from_queue(base_ptr, cluster_id) {
             let heap_pointer = ItemPointer::new(
@@ -871,7 +869,7 @@ unsafe fn process_cluster_vectors<S: Storage>(
                 index_pointer,
                 labeled_vector,
                 storage,
-                &mut insert_stats,
+                &mut write_stats.prune_neighbor_stats,
             );
 
             if consumer_state.first_node.is_none() {
@@ -882,7 +880,7 @@ unsafe fn process_cluster_vectors<S: Storage>(
 
             // Periodically flush neighbor cache to reduce disk I/O
             if consumer_state.ntuples % flush_interval == 0 {
-                graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+                graph.maybe_flush_neighbor_cache(storage, &mut write_stats.prune_neighbor_stats);
             }
         } else if queues.is_queue_finished(base_ptr, cluster_id) {
             break;
@@ -892,7 +890,7 @@ unsafe fn process_cluster_vectors<S: Storage>(
     }
 
     // Final flush after all vectors are processed
-    graph.maybe_flush_neighbor_cache(storage, &mut insert_stats);
+    graph.maybe_flush_neighbor_cache(storage, &mut write_stats.prune_neighbor_stats);
 }
 
 unsafe fn build_cluster_subgraph(
@@ -948,6 +946,8 @@ unsafe fn build_cluster_subgraph(
                 &mut tape,
                 &mut write_stats,
             );
+
+            finalize_cluster_build(&mut plain, graph, index_relation, &mut write_stats);
         }
         StorageType::SbqCompression => {
             let mut bq = unsafe {
@@ -972,8 +972,58 @@ unsafe fn build_cluster_subgraph(
                 &mut tape,
                 &mut write_stats,
             );
+
+            finalize_cluster_build(&mut bq, graph, index_relation, &mut write_stats);
         }
     }
 
-    notice!("Consumer for cluster {} processed {} vectors", cluster_id, consumer_state.ntuples);
+    notice!(
+        "Consumer for cluster {} completed: {} vectors, {} nodes, {} neighbors",
+        cluster_id,
+        consumer_state.ntuples,
+        write_stats.num_nodes,
+        write_stats.num_neighbors
+    );
+}
+
+/// Finalize the cluster build by processing any remaining neighbor cache entries.
+/// This ensures all neighbors are properly pruned and written to disk.
+fn finalize_cluster_build<S: Storage>(
+    storage: &mut S,
+    graph: Graph,
+    index_relation: &PgRelation,
+    write_stats: &mut WriteStats,
+) {
+    let (neighbor_store, meta_page) = graph.into_parts();
+    let cache_entries = neighbor_store.into_sorted();
+
+    for (index_pointer, entry) in cache_entries {
+        write_stats.num_nodes += 1;
+
+        // Final prune if needed
+        let neighbors = if entry.neighbors.len() > meta_page.get_num_neighbors() as _ {
+            Graph::prune_neighbors(
+                meta_page.get_max_alpha(),
+                meta_page.get_num_neighbors() as _,
+                entry.labels.as_ref(),
+                entry.neighbors,
+                storage,
+                &mut write_stats.prune_neighbor_stats,
+            )
+        } else {
+            entry.neighbors
+        };
+
+        write_stats.num_neighbors += neighbors.len();
+
+        storage.finalize_node_at_end_of_build(
+            index_pointer,
+            neighbors.as_slice(),
+            write_stats,
+        );
+    }
+
+    // Note: We do NOT call meta_page.store() here because multiple workers
+    // are running concurrently. The meta_page will be stored by the producer
+    // after all workers have finished.
 }
