@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
+use pgrx::*;
 
 pub const SHM_TOC_SHARED_KEY: u64 = 0xD000000000000001;
 pub const SHM_TOC_TABLESCANDESC_KEY: u64 = 0xD000000000000002;
@@ -583,6 +584,7 @@ impl ClusterStartNodes {
         &self,
         cluster_id: usize,
         start_node: pg_sys::ItemPointerData,
+        worker_id: Option<usize>,
     ) -> bool {
         if cluster_id >= self.num_clusters {
             return false;
@@ -605,6 +607,19 @@ impl ClusterStartNodes {
                 };
                 // 使用内存屏障确保写入顺序：nodes 写入在 initialized 设置之前完成
                 std::sync::atomic::fence(Ordering::Release);
+                
+                // 打印日志：哪个 worker 设置了 start node
+                if let Some(wid) = worker_id {
+                    log!(
+                        "[Worker {}] Successfully set start node for cluster {}: {:?}",
+                        wid, cluster_id, start_node
+                    );
+                } else {
+                    log!(
+                        "[Unknown Worker] Successfully set start node for cluster {}: {:?}",
+                        cluster_id, start_node
+                    );
+                }
             }
             true
         } else {

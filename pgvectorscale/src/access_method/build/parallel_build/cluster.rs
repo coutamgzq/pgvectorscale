@@ -1269,6 +1269,7 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
             _num_dimensions: params.num_dimensions,
             ntuples: 0,
             first_node: None,
+            worker_number,
         };
 
         build_cluster_subgraph(
@@ -1306,6 +1307,7 @@ struct ConsumerState {
     _num_dimensions: usize,
     ntuples: usize,
     first_node: Option<crate::util::ItemPointer>,
+    worker_number: usize,
 }
 
 /// Process vectors from queue and build graph for a single cluster.
@@ -1396,15 +1398,12 @@ unsafe fn process_cluster_vectors<S: Storage>(
                         let mut item_pointer_data = pg_sys::ItemPointerData::default();
                         index_pointer.to_item_pointer_data(&mut item_pointer_data);
 
-                        if (*cluster_start_nodes).try_set_start_node(cluster_id, item_pointer_data) {
+                        if (*cluster_start_nodes).try_set_start_node(cluster_id, item_pointer_data, Some(consumer_state.worker_number)) {
                             // 设置成功，当前 Worker 是设置者
                             // 使用 StartNodes 包装 index_pointer
                             let start_nodes = StartNodes::new(index_pointer);
                             meta_page.set_start_nodes(start_nodes);
-                            log!(
-                                "Worker set start node for cluster {}: {:?}",
-                                cluster_id, index_pointer
-                            );
+                            // 日志已在 try_set_start_node 中打印
                         } else {
                             // 其他 Worker 已经设置，获取它
                             if let Some(start_node) = (*cluster_start_nodes).get_start_node(cluster_id) {
@@ -1412,15 +1411,21 @@ unsafe fn process_cluster_vectors<S: Storage>(
                                 let start_nodes = StartNodes::new(item_ptr);
                                 meta_page.set_start_nodes(start_nodes);
                                 log!(
-                                    "Worker got existing start node for cluster {}: {:?}",
-                                    cluster_id, start_node
+                                    "[Worker {}] Got existing start node for cluster {}: {:?}",
+                                    consumer_state.worker_number, cluster_id, start_node
                                 );
                             }
                         }
                     } else {
                         // 3. Start node 已存在，直接使用
-                        let item_ptr = unsafe { ItemPointer::with_item_pointer_data(shared_start_node.unwrap()) };
+                        let start_node = shared_start_node.unwrap();
+                        log!(
+                            "[Worker {}] Using existing start node for cluster {}: {:?}",
+                            consumer_state.worker_number, cluster_id, start_node
+                        );
+                        let item_ptr = unsafe { ItemPointer::with_item_pointer_data(start_node) };
                         let start_nodes = StartNodes::new(item_ptr);
+                        
                         meta_page.set_start_nodes(start_nodes);
                     }
 
