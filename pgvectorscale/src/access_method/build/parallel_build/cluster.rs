@@ -10,6 +10,7 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
 use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
+use crate::access_method::guc::TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO;
 use crate::access_method::k_means;
 use crate::access_method::labels::LabeledVector;
 use crate::access_method::meta_page::MetaPage;
@@ -355,10 +356,20 @@ fn do_parallel_cluster_build(
     );
     // Calculate worker distribution
     let num_workers = workers.min(MAX_WORKERS).max(num_clusters);
-    log!("DEBUG: workers={}, MAX_WORKERS={}, num_clusters={}, num_workers={}", workers, MAX_WORKERS, num_clusters, num_workers);
+    log!(
+        "DEBUG: workers={}, MAX_WORKERS={}, num_clusters={}, num_workers={}",
+        workers,
+        MAX_WORKERS,
+        num_clusters,
+        num_workers
+    );
     let worker_distribution =
         calculate_worker_distribution(&sampling_result.cluster_stats, num_workers);
-    log!("Queue capacities: {:?}, Worker distribution: {:?}", queue_capacities, worker_distribution);
+    log!(
+        "Queue capacities: {:?}, Worker distribution: {:?}",
+        queue_capacities,
+        worker_distribution
+    );
 
     unsafe {
         pg_sys::EnterParallelMode();
@@ -520,10 +531,18 @@ fn do_parallel_cluster_build(
         }
 
         let launched = (*pcxt).nworkers_launched as usize;
-        log!("Launched {} parallel workers (requested {})", launched, num_workers);
-        
+        log!(
+            "Launched {} parallel workers (requested {})",
+            launched,
+            num_workers
+        );
+
         if launched < num_workers {
-            warning!("Only {} of {} requested workers were launched", launched, num_workers);
+            warning!(
+                "Only {} of {} requested workers were launched",
+                launched,
+                num_workers
+            );
         }
 
         pg_sys::WaitForParallelWorkersToAttach(pcxt);
@@ -535,12 +554,19 @@ fn do_parallel_cluster_build(
             if workers.is_empty() {
                 continue;
             }
-            
-            let estimated_cluster_size = sampling_result.cluster_stats.get(cluster_id)
+
+            let estimated_cluster_size = sampling_result
+                .cluster_stats
+                .get(cluster_id)
                 .map(|s| s.count)
                 .unwrap_or(0);
-            log!("  Cluster {}: workers {:?}, estimated size {}", cluster_id, workers, estimated_cluster_size);
-            
+            log!(
+                "  Cluster {}: workers {:?}, estimated size {}",
+                cluster_id,
+                workers,
+                estimated_cluster_size
+            );
+
             let workers_for_cluster = workers.len();
             let chunk_size = if estimated_cluster_size > 0 {
                 (estimated_cluster_size + workers_for_cluster - 1) / workers_for_cluster
@@ -1136,8 +1162,7 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
     }
 
     let parallel_shared: *mut ParallelShared = unsafe {
-        pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_SHARED_KEY, true)
-            .cast::<ParallelShared>()
+        pg_sys::shm_toc_lookup(shm_toc, parallel::SHM_TOC_SHARED_KEY, true).cast::<ParallelShared>()
     };
     if parallel_shared.is_null() {
         return;
@@ -1341,6 +1366,29 @@ unsafe fn process_cluster_vectors<S: Storage>(
     write_stats: &mut WriteStats,
     cluster_start_nodes: *mut ClusterStartNodes,
 ) {
+    if TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO.get() {
+        let worker_name = unsafe {
+            let mut displen: i32 = 0;
+            let ptr = pg_sys::get_ps_display(&mut displen);
+            if ptr.is_null() {
+                format!("worker_{}", consumer_state.worker_number)
+            } else {
+                let slice = std::slice::from_raw_parts(ptr as *const u8, displen as usize);
+                String::from_utf8_lossy(slice).to_string()
+            }
+        };
+
+        log!(
+            "[START] {} (Worker {}) starting to process cluster {}: range [{}..{}], is_primary={}",
+            worker_name,
+            consumer_state.worker_number,
+            cluster_id,
+            consumer_state.start_idx,
+            consumer_state.end_idx,
+            consumer_state.is_primary
+        );
+    }
+
     let mut insert_stats = InsertStats::default();
     let mut queue_idx: usize = 0;
     let start_idx = consumer_state.start_idx;
@@ -1413,7 +1461,11 @@ unsafe fn process_cluster_vectors<S: Storage>(
                         let mut item_pointer_data = pg_sys::ItemPointerData::default();
                         index_pointer.to_item_pointer_data(&mut item_pointer_data);
 
-                        if (*cluster_start_nodes).try_set_start_node(cluster_id, item_pointer_data, Some(consumer_state.worker_number)) {
+                        if (*cluster_start_nodes).try_set_start_node(
+                            cluster_id,
+                            item_pointer_data,
+                            Some(consumer_state.worker_number),
+                        ) {
                             // 设置成功，当前 Worker 是设置者
                             // 使用 StartNodes 包装 index_pointer
                             let start_nodes = StartNodes::new(index_pointer);
@@ -1421,13 +1473,18 @@ unsafe fn process_cluster_vectors<S: Storage>(
                             // 日志已在 try_set_start_node 中打印
                         } else {
                             // 其他 Worker 已经设置，获取它
-                            if let Some(start_node) = (*cluster_start_nodes).get_start_node(cluster_id) {
-                                let item_ptr = unsafe { ItemPointer::with_item_pointer_data(start_node) };
+                            if let Some(start_node) =
+                                (*cluster_start_nodes).get_start_node(cluster_id)
+                            {
+                                let item_ptr =
+                                    unsafe { ItemPointer::with_item_pointer_data(start_node) };
                                 let start_nodes = StartNodes::new(item_ptr);
                                 meta_page.set_start_nodes(start_nodes);
                                 log!(
                                     "[Worker {}] Got existing start node for cluster {}: {:?}",
-                                    consumer_state.worker_number, cluster_id, start_node
+                                    consumer_state.worker_number,
+                                    cluster_id,
+                                    start_node
                                 );
                             }
                         }
@@ -1436,11 +1493,13 @@ unsafe fn process_cluster_vectors<S: Storage>(
                         let start_node = shared_start_node.unwrap();
                         log!(
                             "[Worker {}] Using existing start node for cluster {}: {:?}",
-                            consumer_state.worker_number, cluster_id, start_node
+                            consumer_state.worker_number,
+                            cluster_id,
+                            start_node
                         );
                         let item_ptr = unsafe { ItemPointer::with_item_pointer_data(start_node) };
                         let start_nodes = StartNodes::new(item_ptr);
-                        
+
                         meta_page.set_start_nodes(start_nodes);
                     }
 
@@ -1509,10 +1568,10 @@ unsafe fn build_cluster_subgraph(
     // This ensures more frequent synchronization for multi-worker clusters
     let total_vectors = unsafe { (*consumer_state._parallel_shared).params.total_vectors };
     let num_clusters = unsafe { (*consumer_state._parallel_shared).params.num_clusters as usize };
-    
+
     // Estimate vectors per cluster (total / num_clusters)
     let cluster_vectors = total_vectors / num_clusters.max(1);
-    
+
     // Adjust flush interval: divide by workers_per_cluster to ensure more frequent flushes
     // when multiple workers are building the same cluster
     let base_flush_interval = parallel::flush_rate(cluster_vectors.max(1));
@@ -1522,7 +1581,7 @@ unsafe fn build_cluster_subgraph(
     } else {
         base_flush_interval
     };
-    
+
     log!(
         "Cluster {}: workers={}, cluster_vectors={}, flush_interval={}",
         cluster_id,
@@ -1578,9 +1637,26 @@ unsafe fn build_cluster_subgraph(
         }
     }
 
+    // 打印详细的统计信息
+    let worker_name = unsafe {
+        let mut displen: i32 = 0;
+        let ptr = pg_sys::get_ps_display(&mut displen);
+        if ptr.is_null() {
+            format!("worker_{}", consumer_state.worker_number)
+        } else {
+            let slice = std::slice::from_raw_parts(ptr as *const u8, displen as usize);
+            String::from_utf8_lossy(slice).to_string()
+        }
+    };
+
     log!(
-        "Consumer for cluster {} processed {} vectors",
+        "[SUMMARY] {} (Worker {}) finished cluster {}: processed {} vectors, range [{}..{}], is_primary={}",
+        worker_name,
+        consumer_state.worker_number,
         cluster_id,
-        consumer_state.ntuples
+        consumer_state.ntuples,
+        consumer_state.start_idx,
+        consumer_state.end_idx,
+        consumer_state.is_primary
     );
 }

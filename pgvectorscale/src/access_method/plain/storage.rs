@@ -1,4 +1,4 @@
-use pgrx::{pg_sys::AttrNumber, PgBox, PgRelation};
+use pgrx::{log, pg_sys, pg_sys::AttrNumber, PgBox, PgRelation};
 
 use crate::{
     access_method::{
@@ -8,6 +8,7 @@ use crate::{
             neighbor_with_distance::{DistanceWithTieBreak, NeighborWithDistance},
             ListSearchNeighbor, ListSearchResult,
         },
+        guc::TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO,
         labels::{LabelSet, LabeledVector},
         meta_page::MetaPage,
         node::{ReadableNode, WriteableNode},
@@ -312,6 +313,43 @@ impl Storage for PlainStorage<'_> {
         neighbors: &[NeighborWithDistance],
         stats: &mut S,
     ) {
+        if TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO.get() {
+            let worker_name = unsafe {
+                let mut displen: i32 = 0;
+                let ptr = pg_sys::get_ps_display(&mut displen);
+                if ptr.is_null() {
+                    "unknown".to_string()
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr as *const u8, displen as usize);
+                    String::from_utf8_lossy(slice).to_string()
+                }
+            };
+
+            let neighbor_tids: Vec<String> = neighbors
+                .iter()
+                .take(3)
+                .map(|n| {
+                    let ip = n.get_index_pointer_to_neighbor();
+                    format!("({},{})", ip.block_number, ip.offset)
+                })
+                .collect();
+
+            let more = if neighbors.len() > 3 {
+                format!(" ... and {} more", neighbors.len() - 3)
+            } else {
+                String::new()
+            };
+
+            log!(
+                "[NEIGHBORS] {} | Page {} Offset {} | Neighbors: [{}]{}",
+                worker_name,
+                index_pointer.block_number,
+                index_pointer.offset,
+                neighbor_tids.join(", "),
+                more
+            );
+        }
+
         let mut node = unsafe { PlainNode::modify(self.index, index_pointer, stats) };
         let mut archived = node.get_archived_node();
         archived

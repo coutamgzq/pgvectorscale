@@ -1,6 +1,6 @@
 use std::{cell::RefCell, iter::once, marker::PhantomData};
 
-use pgrx::{pg_sys::AttrNumber, PgBox, PgRelation};
+use pgrx::{log, pg_sys, pg_sys::AttrNumber, PgBox, PgRelation};
 
 use crate::{
     access_method::{
@@ -11,6 +11,7 @@ use crate::{
             neighbor_with_distance::{DistanceWithTieBreak, NeighborWithDistance},
             ListSearchNeighbor, ListSearchResult,
         },
+        guc::TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO,
         labels::{LabelSet, LabelSetView, LabeledVector},
         meta_page::MetaPage,
         pg_vector::PgVector,
@@ -419,6 +420,45 @@ impl Storage for SbqSpeedupStorage<'_> {
         neighbors: &[NeighborWithDistance],
         stats: &mut S,
     ) {
+        // 根据 GUC 参数决定是否打印调试日志
+        if TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO.get() {
+            let worker_name = unsafe {
+                let mut displen: i32 = 0;
+                let ptr = pg_sys::get_ps_display(&mut displen);
+                if ptr.is_null() {
+                    "unknown".to_string()
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr as *const u8, displen as usize);
+                    String::from_utf8_lossy(slice).to_string()
+                }
+            };
+
+            // 简化的邻居信息，只显示前3个
+            let neighbor_tids: Vec<String> = neighbors
+                .iter()
+                .take(3)
+                .map(|n| {
+                    let ip = n.get_index_pointer_to_neighbor();
+                    format!("({},{})", ip.block_number, ip.offset)
+                })
+                .collect();
+
+            let more = if neighbors.len() > 3 {
+                format!(" ... and {} more", neighbors.len() - 3)
+            } else {
+                String::new()
+            };
+
+            log!(
+                "[NEIGHBORS] {} | Page {} Offset {} | Neighbors: [{}]{}",
+                worker_name,
+                index_pointer.block_number,
+                index_pointer.offset,
+                neighbor_tids.join(", "),
+                more
+            );
+        }
+
         let mut cache = self.cache().as_ref().unwrap().borrow_mut();
 
         /* It's important to preload cache with all the items since you can run into deadlocks

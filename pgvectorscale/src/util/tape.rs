@@ -1,8 +1,10 @@
 //! Tape provides a simple infinite-tape-writing abstraction over postgres pages.
 
 use super::page::{PageType, ReadablePage, WritablePage};
+use crate::access_method::guc::TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO;
 use pgrx::{
-    pg_sys::{BlockNumber, ForkNumber, RelationGetNumberOfBlocksInFork, BLCKSZ},
+    log,
+    pg_sys::{self, BlockNumber, ForkNumber, RelationGetNumberOfBlocksInFork, BLCKSZ},
     PgRelation,
 };
 
@@ -65,6 +67,29 @@ impl<'a> Tape<'a> {
         let offset_number = current_page.add_item_unchecked(data);
 
         let item_pointer = super::ItemPointer::with_page(&current_page, offset_number);
+
+        if TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO.get() {
+            let worker_name = {
+                let mut displen: i32 = 0;
+                let ptr = pg_sys::get_ps_display(&mut displen);
+                if ptr.is_null() {
+                    "unknown".to_string()
+                } else {
+                    let slice = std::slice::from_raw_parts(ptr as *const u8, displen as usize);
+                    String::from_utf8_lossy(slice).to_string()
+                }
+            };
+
+            log!(
+                "[NODE] {} | Creating new node at Page {} Offset {} (size {} bytes, page_type {:?})",
+                worker_name,
+                item_pointer.block_number,
+                item_pointer.offset,
+                size,
+                self.page_type
+            );
+        }
+
         current_page.commit();
 
         item_pointer

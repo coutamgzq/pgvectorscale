@@ -10,6 +10,7 @@ pub static TSV_NUM_CLUSTERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub static TSV_CLUSTERING_MAX_SAMPLE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(100000);
 pub static TSV_CLUSTERING_SAMPLE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000000);
 pub static TSV_CLUSTER_SEARCH_TOP_K: GucSetting<i32> = GucSetting::<i32>::new(2);
+pub static TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -179,6 +180,21 @@ pub fn init() {
         &TSV_CLUSTER_SEARCH_TOP_K,
         1,
         1024,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.debug_graph_flush_page_info".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Enable debug logging for graph page flush information".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When enabled, logs detailed information about which worker writes to which page during graph construction. Default is off.".as_pg_cstr())
+        },
+        &TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO,
         GucContext::Userset,
         GucFlags::default(),
     );
