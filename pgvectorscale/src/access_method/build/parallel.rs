@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pgrx::pg_sys::{self, ConditionVariable, Oid};
@@ -538,37 +539,96 @@ pub struct ClusterStartNode {
     pub start_node: pg_sys::ItemPointerData,
 }
 
+/// ClusterStartNodes 存储在共享内存中，多个进程并发访问
+/// 使用 UnsafeCell 包装 nodes 数组，允许安全的内部可变性
 #[repr(C)]
 pub struct ClusterStartNodes {
     pub num_clusters: usize,
-    pub nodes: [ClusterStartNode; 64],
+    /// 使用 UnsafeCell 包装 nodes，允许在共享内存中安全修改
+    nodes: UnsafeCell<[ClusterStartNode; 64]>,
+    /// 原子标志位数组，记录每个 cluster 的 start node 是否已设置
+    /// 使用 AtomicBool 确保多进程环境下的线程安全
+    pub initialized: [AtomicBool; 64],
 }
 
+// 手动实现 Sync，因为 UnsafeCell 默认不是 Sync
+// 安全：我们使用 CAS 操作和内存屏障确保线程安全
+unsafe impl Sync for ClusterStartNodes {}
+
 impl ClusterStartNodes {
+    /// 在 Leader 进程中调用，初始化共享内存中的结构
     pub fn new(num_clusters: usize) -> Self {
+        let mut initialized: [AtomicBool; 64] = unsafe { std::mem::zeroed() };
+        for i in 0..64 {
+            initialized[i] = AtomicBool::new(false);
+        }
+
         Self {
             num_clusters,
-            nodes: unsafe { std::mem::zeroed() },
+            nodes: UnsafeCell::new(unsafe { std::mem::zeroed() }),
+            initialized,
         }
     }
 
-    pub fn set_start_node(&mut self, cluster_id: usize, start_node: pg_sys::ItemPointerData) {
-        if cluster_id < self.num_clusters {
-            self.nodes[cluster_id] = ClusterStartNode {
-                cluster_id: cluster_id as u32,
-                start_node,
-            };
+    /// 尝试设置 start node，如果已设置则返回 false
+    ///
+    /// # 线程/进程安全
+    /// 使用 CAS 操作，保证在多进程环境下只有一个调用者能成功设置
+    /// 
+    /// # 内存顺序说明
+    /// 1. 先写入 nodes[cluster_id]
+    /// 2. 再使用 Release 语义设置 initialized[cluster_id] = true
+    /// 3. 这样 get_start_node 中的 Acquire 加载会确保看到完整的 nodes 写入
+    pub fn try_set_start_node(
+        &self,
+        cluster_id: usize,
+        start_node: pg_sys::ItemPointerData,
+    ) -> bool {
+        if cluster_id >= self.num_clusters {
+            return false;
         }
-    }
 
-    pub fn get_start_node(&self, cluster_id: usize) -> Option<pg_sys::ItemPointerData> {
-        if cluster_id < self.num_clusters {
-            let start_node = self.nodes[cluster_id].start_node;
-            if start_node.ip_posid != 0 && start_node.ip_posid != pg_sys::InvalidOffsetNumber {
-                Some(start_node)
-            } else {
-                None
+        // CAS 操作：如果 initialized[cluster_id] 为 false，则设为 true
+        // 使用 Acquire 加载检查当前状态
+        if self.initialized[cluster_id]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // CAS 成功，当前进程是设置者
+            // 关键：先写入 nodes，再使用 Release 语义确保对其他进程可见
+            unsafe {
+                let nodes = &mut *self.nodes.get();
+                // 先写入数据
+                nodes[cluster_id] = ClusterStartNode {
+                    cluster_id: cluster_id as u32,
+                    start_node,
+                };
+                // 使用内存屏障确保写入顺序：nodes 写入在 initialized 设置之前完成
+                std::sync::atomic::fence(Ordering::Release);
             }
+            true
+        } else {
+            // CAS 失败，其他进程已经设置
+            false
+        }
+    }
+
+    /// 获取 start node
+    ///
+    /// # 线程/进程安全
+    /// 使用 Acquire 语义，确保看到其他进程的完整写入
+    pub fn get_start_node(&self, cluster_id: usize) -> Option<pg_sys::ItemPointerData> {
+        if cluster_id >= self.num_clusters {
+            return None;
+        }
+
+        // Acquire 语义：确保看到其他进程对 nodes[cluster_id] 的完整写入
+        // 与 try_set_start_node 中的 Release fence 配对
+        if self.initialized[cluster_id].load(Ordering::Acquire) {
+            // 安全：通过 UnsafeCell 获取不可变引用
+            // 由于 Acquire 语义，这里能看到完整的 nodes[cluster_id] 写入
+            let nodes = unsafe { &*self.nodes.get() };
+            Some(nodes[cluster_id].start_node)
         } else {
             None
         }

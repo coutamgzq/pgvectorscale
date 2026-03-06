@@ -8,6 +8,7 @@ use rand::Rng;
 use crate::access_method::distance;
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
+use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
 use crate::access_method::k_means;
 use crate::access_method::labels::LabeledVector;
@@ -1276,15 +1277,11 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
             &index_relation,
             &mut meta_page,
             &centroids,
+            cluster_start_nodes,
         );
 
-        if is_primary {
-            if let Some(first_node) = consumer_state.first_node {
-                let mut item_pointer_data = pg_sys::ItemPointerData::default();
-                first_node.to_item_pointer_data(&mut item_pointer_data);
-                (*cluster_start_nodes).set_start_node(cluster_id, item_pointer_data);
-            }
-        }
+        // Note: Start node is now set in process_cluster_vectors using CAS operation
+        // to ensure thread-safety across multiple workers in the same cluster
 
         (*parallel_shared)
             .build_state
@@ -1325,12 +1322,14 @@ unsafe fn process_cluster_vectors<S: Storage>(
     graph: &mut Graph,
     tape: &mut Tape,
     write_stats: &mut WriteStats,
+    cluster_start_nodes: *mut ClusterStartNodes,
 ) {
     let mut insert_stats = InsertStats::default();
     let mut queue_idx: usize = 0;
     let start_idx = consumer_state.start_idx;
     let end_idx = consumer_state.end_idx;
     let num_dimensions = meta_page.get_num_dimensions_to_index() as usize;
+    let mut start_node_set = false; // 标记是否已处理 start node
 
     let mut batch_heap_tids: Vec<pg_sys::ItemPointerData> = vec![std::mem::zeroed(); BATCH_SIZE];
     let mut batch_vectors: Vec<Vec<f32>> = (0..BATCH_SIZE)
@@ -1387,6 +1386,49 @@ unsafe fn process_cluster_vectors<S: Storage>(
                     write_stats,
                 );
 
+                // ===== 关键修改：在 graph insert 之前处理 start node =====
+                if !start_node_set {
+                    // 1. 尝试获取或设置共享 start node
+                    let shared_start_node = (*cluster_start_nodes).get_start_node(cluster_id);
+
+                    if shared_start_node.is_none() {
+                        // 2. 尝试设置 start node（CAS 操作）
+                        let mut item_pointer_data = pg_sys::ItemPointerData::default();
+                        index_pointer.to_item_pointer_data(&mut item_pointer_data);
+
+                        if (*cluster_start_nodes).try_set_start_node(cluster_id, item_pointer_data) {
+                            // 设置成功，当前 Worker 是设置者
+                            // 使用 StartNodes 包装 index_pointer
+                            let start_nodes = StartNodes::new(index_pointer);
+                            meta_page.set_start_nodes(start_nodes);
+                            log!(
+                                "Worker set start node for cluster {}: {:?}",
+                                cluster_id, index_pointer
+                            );
+                        } else {
+                            // 其他 Worker 已经设置，获取它
+                            if let Some(start_node) = (*cluster_start_nodes).get_start_node(cluster_id) {
+                                let item_ptr = unsafe { ItemPointer::with_item_pointer_data(start_node) };
+                                let start_nodes = StartNodes::new(item_ptr);
+                                meta_page.set_start_nodes(start_nodes);
+                                log!(
+                                    "Worker got existing start node for cluster {}: {:?}",
+                                    cluster_id, start_node
+                                );
+                            }
+                        }
+                    } else {
+                        // 3. Start node 已存在，直接使用
+                        let item_ptr = unsafe { ItemPointer::with_item_pointer_data(shared_start_node.unwrap()) };
+                        let start_nodes = StartNodes::new(item_ptr);
+                        meta_page.set_start_nodes(start_nodes);
+                    }
+
+                    // 标记已处理过 start node，后续节点不需要再检查
+                    start_node_set = true;
+                }
+                // ==========================================================
+
                 let labeled_vector = LabeledVector::new(PgVector::from_slice(vector_data), None);
                 graph.insert(
                     index_relation,
@@ -1395,10 +1437,6 @@ unsafe fn process_cluster_vectors<S: Storage>(
                     storage,
                     &mut insert_stats,
                 );
-
-                if consumer_state.first_node.is_none() {
-                    consumer_state.first_node = Some(index_pointer);
-                }
 
                 consumer_state.ntuples += 1;
 
@@ -1422,6 +1460,7 @@ unsafe fn build_cluster_subgraph(
     index_relation: &PgRelation,
     meta_page: &mut MetaPage,
     _centroids: &[Vec<f32>],
+    cluster_start_nodes: *mut ClusterStartNodes,
 ) {
     let queues = &*consumer_state.cluster_queues;
     let base_ptr = consumer_state.cluster_queues as *mut u8;
@@ -1465,6 +1504,7 @@ unsafe fn build_cluster_subgraph(
                 &mut graph,
                 &mut tape,
                 &mut write_stats,
+                cluster_start_nodes,
             );
         }
         StorageType::SbqCompression => {
@@ -1489,6 +1529,7 @@ unsafe fn build_cluster_subgraph(
                 &mut graph,
                 &mut tape,
                 &mut write_stats,
+                cluster_start_nodes,
             );
         }
     }
