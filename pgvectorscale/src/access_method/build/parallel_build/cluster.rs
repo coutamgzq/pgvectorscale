@@ -182,6 +182,20 @@ pub fn build_index_with_clustering(
     let vectors_for_clustering = collector.vectors;
     let num_vectors = vectors_for_clustering.len();
 
+    if num_clusters < 2 {
+        error!(
+            "num_clusters ({}) must be at least 2 for clustering",
+            num_clusters
+        );
+    }
+
+    if num_clusters > 64 {
+        error!(
+            "num_clusters ({}) exceeds maximum allowed value of 64",
+            num_clusters
+        );
+    }
+
     if num_vectors > 0 {
         notice!("Collected {} vectors for k-means clustering", num_vectors);
     }
@@ -325,7 +339,8 @@ fn do_parallel_cluster_build(
     );
     log!(
         "Indexing {} vectors with {} dimensions",
-        heap_tuples, num_dimensions
+        heap_tuples,
+        num_dimensions
     );
 
     let start_time = std::time::Instant::now();
@@ -1406,6 +1421,7 @@ unsafe fn process_cluster_vectors<S: Storage>(
         let batch_count = available.min(BATCH_SIZE);
 
         if batch_count > 0 {
+            check_for_interrupts!();
             let popped = queues.pop_batch_from_queue(
                 base_ptr,
                 cluster_id,

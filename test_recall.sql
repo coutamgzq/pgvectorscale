@@ -27,8 +27,8 @@ SELECT
 FROM generate_series(1, 5000) AS i;
 
 -- Test with different cluster configurations
-\echo 'Test 1: No clustering (num_clusters = 1)'
-SET diskann.num_clusters = 1;
+\echo 'Test 1: No clustering (num_clusters = 0 or default)'
+SET diskann.num_clusters = 0;
 DROP INDEX IF EXISTS idx_recall_1;
 CREATE INDEX idx_recall_1 ON test_recall USING diskann (embedding vector_cosine_ops);
 

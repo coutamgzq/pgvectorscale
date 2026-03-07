@@ -4,11 +4,7 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 
 use crate::{
     access_method::{
-        graph::{
-            neighbor_store::GraphNeighborStore,
-        },
-        labels::LabeledVector,
-        meta_page::MetaPage,
+        graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
         sbq::storage::SbqSpeedupStorage,
     },
     util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
@@ -121,6 +117,7 @@ impl Ord for ResortData {
 }
 
 /// Result from searching a single cluster
+#[derive(Clone)]
 struct ClusterSearchResult {
     heap_pointer: HeapPointer,
     index_pointer: IndexPointer,
@@ -143,8 +140,171 @@ impl PartialOrd for ClusterSearchResult {
 
 impl Ord for ClusterSearchResult {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Min heap: smaller distance has higher priority
         other.distance.total_cmp(&self.distance)
+    }
+}
+
+struct ClusterSearchState<QDM, PD> {
+    cluster_id: u32,
+    lsr: ListSearchResult<QDM, PD>,
+    current_best_distance: f32,
+    is_exhausted: bool,
+}
+
+impl<QDM, PD> PartialEq for ClusterSearchState<QDM, PD> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cluster_id == other.cluster_id
+    }
+}
+
+impl<QDM, PD> Eq for ClusterSearchState<QDM, PD> {}
+
+impl<QDM, PD> PartialOrd for ClusterSearchState<QDM, PD> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<QDM, PD> Ord for ClusterSearchState<QDM, PD> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .current_best_distance
+            .partial_cmp(&self.current_best_distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+struct ClusterRacingSearcher<QDM, PD> {
+    cluster_states: BinaryHeap<ClusterSearchState<QDM, PD>>,
+    results: BinaryHeap<ClusterSearchResult>,
+    target_count: usize,
+    max_iterations_per_cluster: usize,
+    total_iterations: usize,
+}
+
+impl<QDM, PD> ClusterRacingSearcher<QDM, PD> {
+    fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+        storage: &S,
+        meta_page: &MetaPage,
+        query: LabeledVector,
+        search_list_size: usize,
+        target_count: usize,
+    ) -> Self {
+        let cluster_start_nodes = meta_page.get_all_cluster_start_nodes();
+        let num_neighbors = meta_page.get_num_neighbors();
+
+        let mut cluster_states = BinaryHeap::new();
+
+        for (&cluster_id, &start_node) in cluster_start_nodes.iter() {
+            let query_clone = query.clone();
+            let dm = storage.get_query_distance_measure(query_clone);
+
+            let lsr = ListSearchResult::new(
+                vec![start_node],
+                dm,
+                None,
+                search_list_size,
+                num_neighbors,
+                &mut GraphNeighborStore::Disk,
+                storage,
+            );
+
+            cluster_states.push(ClusterSearchState {
+                cluster_id,
+                lsr,
+                current_best_distance: f32::INFINITY,
+                is_exhausted: false,
+            });
+        }
+
+        Self {
+            cluster_states,
+            results: BinaryHeap::new(),
+            target_count,
+            max_iterations_per_cluster: search_list_size,
+            total_iterations: 0,
+        }
+    }
+
+    fn step<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+        &mut self,
+        storage: &S,
+        meta_page: &mut MetaPage,
+        no_filter: bool,
+    ) -> Option<ClusterSearchResult> {
+        if self.cluster_states.is_empty() {
+            return None;
+        }
+
+        let mut state = self.cluster_states.pop()?;
+
+        if state.is_exhausted {
+            return None;
+        }
+
+        let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
+
+        graph.greedy_search_iterate(&mut state.lsr, 1, no_filter, None, storage);
+
+        self.total_iterations += 1;
+
+        match state.lsr.consume_with_distance(storage) {
+            Some((heap_pointer, index_pointer, distance)) => {
+                state.current_best_distance = distance;
+
+                if heap_pointer.offset != InvalidOffsetNumber {
+                    let result = ClusterSearchResult {
+                        heap_pointer,
+                        index_pointer,
+                        distance,
+                    };
+
+                    if !state.lsr.is_empty() {
+                        self.cluster_states.push(state);
+                    } else {
+                        state.is_exhausted = true;
+                    }
+
+                    return Some(result);
+                } else {
+                    if !state.lsr.is_empty() {
+                        self.cluster_states.push(state);
+                    } else {
+                        state.is_exhausted = true;
+                    }
+                    return None;
+                }
+            }
+            None => {
+                state.is_exhausted = true;
+                None
+            }
+        }
+    }
+
+    fn search<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+        &mut self,
+        storage: &S,
+        meta_page: &mut MetaPage,
+        no_filter: bool,
+    ) -> BinaryHeap<ClusterSearchResult> {
+        let max_total_iterations = self.cluster_states.len() * self.max_iterations_per_cluster * 2;
+
+        while self.results.len() < self.target_count && self.total_iterations < max_total_iterations
+        {
+            match self.step(storage, meta_page, no_filter) {
+                Some(result) => {
+                    self.results.push(result);
+                }
+                None => {
+                    if self.cluster_states.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.results.clone()
     }
 }
 
@@ -280,54 +440,12 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             return BinaryHeap::new();
         }
 
-        let start_nodes_vec: Vec<IndexPointer> = cluster_start_nodes.values().copied().collect();
-        let mut all_results = BinaryHeap::new();
-        let num_neighbors = meta_page.get_num_neighbors();
+        let target_count = search_list_size * 3;
 
-        for start_node in start_nodes_vec {
-            let query_clone = query.clone();
-            let dm = storage.get_query_distance_measure(query_clone);
+        let mut searcher =
+            ClusterRacingSearcher::new(storage, meta_page, query, search_list_size, target_count);
 
-            let mut lsr = ListSearchResult::new(
-                vec![start_node],
-                dm,
-                None,
-                search_list_size,
-                num_neighbors,
-                &mut GraphNeighborStore::Disk,
-                storage,
-            );
-
-            let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
-
-            loop {
-                graph.greedy_search_iterate(
-                    &mut lsr,
-                    search_list_size,
-                    no_filter,
-                    None,
-                    storage,
-                );
-
-                while let Some((heap_pointer, index_pointer, distance)) =
-                    lsr.consume_with_distance(storage)
-                {
-                    if heap_pointer.offset != InvalidOffsetNumber {
-                        all_results.push(ClusterSearchResult {
-                            heap_pointer,
-                            index_pointer,
-                            distance,
-                        });
-                    }
-                }
-
-                if lsr.is_empty() {
-                    break;
-                }
-            }
-        }
-
-        all_results
+        searcher.search(storage, meta_page, no_filter)
     }
 }
 

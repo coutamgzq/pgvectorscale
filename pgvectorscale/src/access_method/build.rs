@@ -10,7 +10,7 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
 use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
-use crate::access_method::options::TSVIndexOptions;
+use crate::access_method::options::{TSVIndexOptions, NUM_CLUSTERS_DEFAULT_SENTINEL};
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
 use crate::util::ports::acquire_index_lock;
@@ -312,8 +312,14 @@ pub extern "C-unwind" fn ambuild(
         opt.get_storage_type(),
     );
 
-    let num_clusters = opt.get_num_clusters() as usize;
-    let use_clustering = num_clusters > 1;
+    let num_clusters_raw = opt.get_num_clusters();
+    let num_clusters = if num_clusters_raw == NUM_CLUSTERS_DEFAULT_SENTINEL || num_clusters_raw <= 1
+    {
+        0
+    } else {
+        num_clusters_raw as usize
+    };
+    let use_clustering = num_clusters >= 2;
 
     if use_clustering {
         notice!("Using k-means clustering with {} clusters", num_clusters);

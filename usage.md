@@ -82,12 +82,12 @@ WITH ( "storage_layout" = "memory_optimized", "num_neighbors" = "50", "search_li
 
 
 
-drop index if exists pgvectorscale_index_1m;
+drop index if exists pgvectorscale_index;
 set diskann.parallel_flush_interval=0.08;
 SET diskann.clustering_max_sample_size = 10000;
 SET diskann.clustering_sample_threshold = 500000;
 set diskann.force_parallel_workers=8;
 SET diskann.build_parallel = on;
-CREATE INDEX IF NOT EXISTS  "pgvectorscale_index_1m"  ON public. "pg_vectorscale_collection" 
+CREATE INDEX IF NOT EXISTS  "pgvectorscale_index"  ON public. "pg_vectorscale_collection" 
 USING  "diskann"  (embedding  "vector_cosine_ops" )
 WITH ( "storage_layout" = "memory_optimized", "num_neighbors" = "50", "search_list_size" = "120", "max_alpha" = "1.2", "num_dimensions" = "0", "num_bits_per_dimension" = "2", "num_clusters" = 4 );
