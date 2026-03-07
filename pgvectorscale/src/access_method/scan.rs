@@ -7,7 +7,10 @@ use crate::{
         graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
         sbq::storage::SbqSpeedupStorage,
     },
-    util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
+    util::{
+        buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer,
+        ItemPointer,
+    },
 };
 
 use super::{
@@ -159,6 +162,35 @@ impl StreamingStats {
     }
 }
 
+/// Result from searching a single cluster
+#[derive(Clone, Debug)]
+struct ClusterSearchResult {
+    heap_pointer: HeapPointer,
+    index_pointer: IndexPointer,
+    distance: f32,
+}
+
+impl PartialEq for ClusterSearchResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.heap_pointer == other.heap_pointer
+    }
+}
+
+impl Eq for ClusterSearchResult {}
+
+impl PartialOrd for ClusterSearchResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ClusterSearchResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min heap: smaller distance has higher priority
+        other.distance.total_cmp(&self.distance)
+    }
+}
+
 struct TSVResponseIterator<QDM, PD> {
     lsr: ListSearchResult<QDM, PD>,
     search_list_size: usize,
@@ -171,9 +203,12 @@ struct TSVResponseIterator<QDM, PD> {
     next_calls_with_resort: i32,
     full_distance_comparisons: i32,
     has_label_filter: bool,
+    // Cluster mode fields
+    cluster_results: BinaryHeap<ClusterSearchResult>,
+    is_cluster_mode: bool,
 }
 
-impl<QDM, PD> TSVResponseIterator<QDM, PD> {
+impl<QDM: Clone, PD> TSVResponseIterator<QDM, PD> {
     fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
         storage: &S,
         index: &PgRelation,
@@ -184,34 +219,178 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         quantizer_stats: QuantizerStats,
     ) -> Self {
         let mut meta_page = MetaPage::fetch(index);
-        let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
-
         let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
-        let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
         let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
 
-        Self {
-            search_list_size,
-            lsr,
-            meta_page,
-            quantizer_stats,
-            resort_size,
-            resort_buffer: BinaryHeap::with_capacity(resort_size),
-            streaming_stats: StreamingStats::new(resort_size),
-            next_calls: 0,
-            next_calls_with_resort: 0,
-            full_distance_comparisons: 0,
-            has_label_filter,
+        // Check if we're in cluster mode (no start_nodes means cluster build)
+        let is_cluster_mode = meta_page.get_start_nodes().is_none();
+
+        if is_cluster_mode {
+            // Cluster mode: search each cluster independently and merge results
+            let cluster_results = Self::search_all_clusters(
+                storage,
+                &mut meta_page,
+                query,
+                search_list_size,
+                !has_label_filter,
+            );
+
+            Self {
+                search_list_size,
+                lsr: ListSearchResult::empty(),
+                meta_page,
+                quantizer_stats,
+                resort_size,
+                resort_buffer: BinaryHeap::with_capacity(resort_size),
+                streaming_stats: StreamingStats::new(resort_size),
+                next_calls: 0,
+                next_calls_with_resort: 0,
+                full_distance_comparisons: 0,
+                has_label_filter,
+                cluster_results,
+                is_cluster_mode: true,
+            }
+        } else {
+            // Non-cluster mode: use original streaming search
+            let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
+            let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
+
+            Self {
+                search_list_size,
+                lsr,
+                meta_page,
+                quantizer_stats,
+                resort_size,
+                resort_buffer: BinaryHeap::with_capacity(resort_size),
+                streaming_stats: StreamingStats::new(resort_size),
+                next_calls: 0,
+                next_calls_with_resort: 0,
+                full_distance_comparisons: 0,
+                has_label_filter,
+                cluster_results: BinaryHeap::new(),
+                is_cluster_mode: false,
+            }
         }
+    }
+
+    /// Search all clusters independently and merge results into a single priority queue
+    fn search_all_clusters<S: Storage>(
+        storage: &S,
+        meta_page: &mut MetaPage,
+        query: LabeledVector,
+        search_list_size: usize,
+        no_filter: bool,
+    ) -> BinaryHeap<ClusterSearchResult>
+    where
+        S::QueryDistanceMeasure: Clone,
+    {
+        let cluster_start_nodes = meta_page.get_all_cluster_start_nodes();
+        let num_neighbors = meta_page.get_num_neighbors();
+        let queue_size = super::guc::TSV_CLUSTER_SEARCH_QUEUE_SIZE.get() as usize;
+
+        // Pre-collect start nodes to avoid borrow issues
+        let start_nodes_vec: Vec<(u32, ItemPointer)> = cluster_start_nodes
+            .iter()
+            .map(|(&id, &node)| (id, node))
+            .collect();
+
+        let mut all_results: BinaryHeap<ClusterSearchResult> = BinaryHeap::new();
+        let mut seen_nodes: std::collections::HashSet<ItemPointer> =
+            std::collections::HashSet::new();
+
+        // Calculate results per cluster to distribute queue size evenly
+        let num_clusters = start_nodes_vec.len().max(1);
+        let results_per_cluster = (queue_size / num_clusters).max(10); // At least 10 per cluster
+
+        for (_cluster_id, start_node) in start_nodes_vec {
+            // Create a fresh distance measure for each cluster search
+            let dm = storage.get_query_distance_measure(query.clone());
+
+            // Create ListSearchResult for this cluster
+            let mut lsr = ListSearchResult::new(
+                vec![start_node],
+                dm,
+                None,
+                search_list_size,
+                num_neighbors,
+                &mut GraphNeighborStore::Disk,
+                storage,
+            );
+
+            let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
+            let mut cluster_result_count = 0;
+
+            // Search this cluster: repeatedly call greedy_search_iterate and consume results
+            // This mimics the behavior of the original next() method
+            loop {
+                // Expand more nodes in the graph
+                graph.greedy_search_iterate(&mut lsr, search_list_size, no_filter, None, storage);
+
+                // Consume one result at a time (like the original next() method)
+                match lsr.consume_with_distance(storage) {
+                    Some((heap_pointer, index_pointer, distance)) => {
+                        // Skip deleted tuples
+                        if heap_pointer.offset == InvalidOffsetNumber {
+                            continue;
+                        }
+
+                        // Deduplicate: skip if we've seen this node before
+                        if !seen_nodes.insert(index_pointer) {
+                            continue;
+                        }
+
+                        all_results.push(ClusterSearchResult {
+                            heap_pointer,
+                            index_pointer,
+                            distance,
+                        });
+
+                        cluster_result_count += 1;
+
+                        // Check if we've reached the per-cluster limit or total queue size limit
+                        if cluster_result_count >= results_per_cluster
+                            || all_results.len() >= queue_size
+                        {
+                            break;
+                        }
+                    }
+                    None => {
+                        // No more results available, need to expand more
+                        if lsr.is_empty() {
+                            // Truly exhausted
+                            break;
+                        }
+                        // Continue to next iteration to expand more nodes
+                        continue;
+                    }
+                }
+            }
+
+            if all_results.len() >= queue_size {
+                break;
+            }
+        }
+
+        all_results
     }
 }
 
 impl<QDM, PD> TSVResponseIterator<QDM, PD> {
     fn next<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
         &mut self,
-        storage: &S,
+        _storage: &S,
     ) -> Option<(HeapPointer, IndexPointer)> {
         self.next_calls += 1;
+
+        // Cluster mode: return results from the pre-computed queue
+        if self.is_cluster_mode {
+            return self
+                .cluster_results
+                .pop()
+                .map(|r| (r.heap_pointer, r.index_pointer));
+        }
+
+        // Non-cluster mode: use original streaming search
         let mut graph = Graph::new(GraphNeighborStore::Disk, &mut self.meta_page);
 
         /* Iterate until we find a non-deleted tuple */
@@ -221,10 +400,10 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
                 self.search_list_size,
                 !self.has_label_filter,
                 None,
-                storage,
+                _storage,
             );
 
-            let item = self.lsr.consume(storage);
+            let item = self.lsr.consume(_storage);
 
             match item {
                 Some((heap_pointer, index_pointer)) => {
@@ -248,6 +427,15 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         storage: &S,
     ) -> Option<(HeapPointer, IndexPointer)> {
         self.next_calls_with_resort += 1;
+
+        // Cluster mode: results already have distances, just return from queue
+        if self.is_cluster_mode {
+            return self
+                .cluster_results
+                .pop()
+                .map(|r| (r.heap_pointer, r.index_pointer));
+        }
+
         if self.resort_buffer.capacity() == 0 {
             return self.next(storage);
         }

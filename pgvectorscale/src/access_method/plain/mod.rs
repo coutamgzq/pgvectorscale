@@ -14,6 +14,7 @@ use storage::PlainStorage;
 use crate::access_method::node::ReadableNode;
 use crate::util::IndexPointer;
 
+#[derive(Clone)]
 pub enum PlainDistanceMeasure {
     Full(LabeledVector),
 }

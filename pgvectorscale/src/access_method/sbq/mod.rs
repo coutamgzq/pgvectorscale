@@ -136,6 +136,7 @@ impl SbqMeans {
     }
 }
 
+#[derive(Clone)]
 pub struct SbqSearchDistanceMeasure {
     vec: Vec<SbqVectorElement>,
     query: LabeledVector,
