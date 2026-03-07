@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    distance::DistanceFn,
+    distance::{DistanceFn, DistanceType},
     graph::{Graph, ListSearchResult},
     labels::LabelSetView,
     plain::{
@@ -440,12 +440,70 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             return BinaryHeap::new();
         }
 
-        let target_count = search_list_size * 3;
+        let centroids = meta_page.get_centroids();
+        if centroids.is_empty() {
+            return BinaryHeap::new();
+        }
 
-        let mut searcher =
-            ClusterRacingSearcher::new(storage, meta_page, query, search_list_size, target_count);
+        let distance_type = meta_page.get_distance_type();
+        let distance_fn = distance_type.get_distance_function();
 
-        searcher.search(storage, meta_page, no_filter)
+        let query_vec = query.vec().to_index_slice();
+
+        let mut min_distance = f32::MAX;
+        let mut nearest_cluster_id: u32 = 0;
+
+        for (cluster_id, centroid) in centroids.iter().enumerate() {
+            let dist = distance_fn(query_vec, centroid);
+            if dist < min_distance {
+                min_distance = dist;
+                nearest_cluster_id = cluster_id as u32;
+            }
+        }
+
+        let start_node = match cluster_start_nodes.get(&nearest_cluster_id) {
+            Some(&node) => node,
+            None => return BinaryHeap::new(),
+        };
+
+        let mut all_results = BinaryHeap::new();
+        let num_neighbors = meta_page.get_num_neighbors();
+
+        let dm = storage.get_query_distance_measure(query);
+
+        let mut lsr = ListSearchResult::new(
+            vec![start_node],
+            dm,
+            None,
+            search_list_size,
+            num_neighbors,
+            &mut GraphNeighborStore::Disk,
+            storage,
+        );
+
+        let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
+
+        loop {
+            graph.greedy_search_iterate(&mut lsr, search_list_size, no_filter, None, storage);
+
+            while let Some((heap_pointer, index_pointer, distance)) =
+                lsr.consume_with_distance(storage)
+            {
+                if heap_pointer.offset != InvalidOffsetNumber {
+                    all_results.push(ClusterSearchResult {
+                        heap_pointer,
+                        index_pointer,
+                        distance,
+                    });
+                }
+            }
+
+            if lsr.is_empty() {
+                break;
+            }
+        }
+
+        all_results
     }
 }
 
