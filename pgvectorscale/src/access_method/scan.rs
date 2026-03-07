@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    distance::{DistanceFn, DistanceType},
+    distance::DistanceFn,
     graph::{Graph, ListSearchResult},
     labels::LabelSetView,
     plain::{
@@ -116,198 +116,6 @@ impl Ord for ResortData {
     }
 }
 
-/// Result from searching a single cluster
-#[derive(Clone)]
-struct ClusterSearchResult {
-    heap_pointer: HeapPointer,
-    index_pointer: IndexPointer,
-    distance: f32,
-}
-
-impl PartialEq for ClusterSearchResult {
-    fn eq(&self, other: &Self) -> bool {
-        self.heap_pointer == other.heap_pointer
-    }
-}
-
-impl Eq for ClusterSearchResult {}
-
-impl PartialOrd for ClusterSearchResult {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ClusterSearchResult {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.distance.total_cmp(&self.distance)
-    }
-}
-
-struct ClusterSearchState<QDM, PD> {
-    cluster_id: u32,
-    lsr: ListSearchResult<QDM, PD>,
-    current_best_distance: f32,
-    is_exhausted: bool,
-}
-
-impl<QDM, PD> PartialEq for ClusterSearchState<QDM, PD> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cluster_id == other.cluster_id
-    }
-}
-
-impl<QDM, PD> Eq for ClusterSearchState<QDM, PD> {}
-
-impl<QDM, PD> PartialOrd for ClusterSearchState<QDM, PD> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<QDM, PD> Ord for ClusterSearchState<QDM, PD> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .current_best_distance
-            .partial_cmp(&self.current_best_distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-
-struct ClusterRacingSearcher<QDM, PD> {
-    cluster_states: BinaryHeap<ClusterSearchState<QDM, PD>>,
-    results: BinaryHeap<ClusterSearchResult>,
-    target_count: usize,
-    max_iterations_per_cluster: usize,
-    total_iterations: usize,
-}
-
-impl<QDM, PD> ClusterRacingSearcher<QDM, PD> {
-    fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        storage: &S,
-        meta_page: &MetaPage,
-        query: LabeledVector,
-        search_list_size: usize,
-        target_count: usize,
-    ) -> Self {
-        let cluster_start_nodes = meta_page.get_all_cluster_start_nodes();
-        let num_neighbors = meta_page.get_num_neighbors();
-
-        let mut cluster_states = BinaryHeap::new();
-
-        for (&cluster_id, &start_node) in cluster_start_nodes.iter() {
-            let query_clone = query.clone();
-            let dm = storage.get_query_distance_measure(query_clone);
-
-            let lsr = ListSearchResult::new(
-                vec![start_node],
-                dm,
-                None,
-                search_list_size,
-                num_neighbors,
-                &mut GraphNeighborStore::Disk,
-                storage,
-            );
-
-            cluster_states.push(ClusterSearchState {
-                cluster_id,
-                lsr,
-                current_best_distance: f32::INFINITY,
-                is_exhausted: false,
-            });
-        }
-
-        Self {
-            cluster_states,
-            results: BinaryHeap::new(),
-            target_count,
-            max_iterations_per_cluster: search_list_size,
-            total_iterations: 0,
-        }
-    }
-
-    fn step<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        &mut self,
-        storage: &S,
-        meta_page: &mut MetaPage,
-        no_filter: bool,
-    ) -> Option<ClusterSearchResult> {
-        if self.cluster_states.is_empty() {
-            return None;
-        }
-
-        let mut state = self.cluster_states.pop()?;
-
-        if state.is_exhausted {
-            return None;
-        }
-
-        let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
-
-        graph.greedy_search_iterate(&mut state.lsr, 1, no_filter, None, storage);
-
-        self.total_iterations += 1;
-
-        match state.lsr.consume_with_distance(storage) {
-            Some((heap_pointer, index_pointer, distance)) => {
-                state.current_best_distance = distance;
-
-                if heap_pointer.offset != InvalidOffsetNumber {
-                    let result = ClusterSearchResult {
-                        heap_pointer,
-                        index_pointer,
-                        distance,
-                    };
-
-                    if !state.lsr.is_empty() {
-                        self.cluster_states.push(state);
-                    } else {
-                        state.is_exhausted = true;
-                    }
-
-                    return Some(result);
-                } else {
-                    if !state.lsr.is_empty() {
-                        self.cluster_states.push(state);
-                    } else {
-                        state.is_exhausted = true;
-                    }
-                    return None;
-                }
-            }
-            None => {
-                state.is_exhausted = true;
-                None
-            }
-        }
-    }
-
-    fn search<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        &mut self,
-        storage: &S,
-        meta_page: &mut MetaPage,
-        no_filter: bool,
-    ) -> BinaryHeap<ClusterSearchResult> {
-        let max_total_iterations = self.cluster_states.len() * self.max_iterations_per_cluster * 2;
-
-        while self.results.len() < self.target_count && self.total_iterations < max_total_iterations
-        {
-            match self.step(storage, meta_page, no_filter) {
-                Some(result) => {
-                    self.results.push(result);
-                }
-                None => {
-                    if self.cluster_states.is_empty() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.results.clone()
-    }
-}
-
 struct StreamingStats {
     count: i32,
     mean: f32,
@@ -363,8 +171,6 @@ struct TSVResponseIterator<QDM, PD> {
     next_calls_with_resort: i32,
     full_distance_comparisons: i32,
     has_label_filter: bool,
-    cluster_results: BinaryHeap<ClusterSearchResult>,
-    is_cluster_mode: bool,
 }
 
 impl<QDM, PD> TSVResponseIterator<QDM, PD> {
@@ -373,137 +179,30 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         index: &PgRelation,
         query: LabeledVector,
         search_list_size: usize,
+        //FIXME?
         _meta_page: MetaPage,
         quantizer_stats: QuantizerStats,
     ) -> Self {
         let mut meta_page = MetaPage::fetch(index);
-        let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
+        let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
+
         let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
+        let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
+        let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
 
-        let is_cluster_mode = meta_page.get_start_nodes().is_none();
-
-        if is_cluster_mode {
-            let cluster_results = Self::search_all_clusters(
-                storage,
-                &mut meta_page,
-                query,
-                search_list_size,
-                !has_label_filter,
-            );
-
-            Self {
-                search_list_size,
-                lsr: ListSearchResult::empty(),
-                meta_page,
-                quantizer_stats,
-                resort_size,
-                resort_buffer: BinaryHeap::with_capacity(resort_size),
-                streaming_stats: StreamingStats::new(resort_size),
-                next_calls: 0,
-                next_calls_with_resort: 0,
-                full_distance_comparisons: 0,
-                has_label_filter,
-                cluster_results,
-                is_cluster_mode: true,
-            }
-        } else {
-            let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
-            let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
-
-            Self {
-                search_list_size,
-                lsr,
-                meta_page,
-                quantizer_stats,
-                resort_size,
-                resort_buffer: BinaryHeap::with_capacity(resort_size),
-                streaming_stats: StreamingStats::new(resort_size),
-                next_calls: 0,
-                next_calls_with_resort: 0,
-                full_distance_comparisons: 0,
-                has_label_filter,
-                cluster_results: BinaryHeap::new(),
-                is_cluster_mode: false,
-            }
-        }
-    }
-
-    fn search_all_clusters<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        storage: &S,
-        meta_page: &mut MetaPage,
-        query: LabeledVector,
-        search_list_size: usize,
-        no_filter: bool,
-    ) -> BinaryHeap<ClusterSearchResult> {
-        let cluster_start_nodes = meta_page.get_all_cluster_start_nodes();
-        if cluster_start_nodes.is_empty() {
-            return BinaryHeap::new();
-        }
-
-        let centroids = meta_page.get_centroids();
-        if centroids.is_empty() {
-            return BinaryHeap::new();
-        }
-
-        let distance_type = meta_page.get_distance_type();
-        let distance_fn = distance_type.get_distance_function();
-
-        let query_vec = query.vec().to_index_slice();
-
-        let mut min_distance = f32::MAX;
-        let mut nearest_cluster_id: u32 = 0;
-
-        for (cluster_id, centroid) in centroids.iter().enumerate() {
-            let dist = distance_fn(query_vec, centroid);
-            if dist < min_distance {
-                min_distance = dist;
-                nearest_cluster_id = cluster_id as u32;
-            }
-        }
-
-        let start_node = match cluster_start_nodes.get(&nearest_cluster_id) {
-            Some(&node) => node,
-            None => return BinaryHeap::new(),
-        };
-
-        let mut all_results = BinaryHeap::new();
-        let num_neighbors = meta_page.get_num_neighbors();
-
-        let dm = storage.get_query_distance_measure(query);
-
-        let mut lsr = ListSearchResult::new(
-            vec![start_node],
-            dm,
-            None,
+        Self {
             search_list_size,
-            num_neighbors,
-            &mut GraphNeighborStore::Disk,
-            storage,
-        );
-
-        let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
-
-        loop {
-            graph.greedy_search_iterate(&mut lsr, search_list_size, no_filter, None, storage);
-
-            while let Some((heap_pointer, index_pointer, distance)) =
-                lsr.consume_with_distance(storage)
-            {
-                if heap_pointer.offset != InvalidOffsetNumber {
-                    all_results.push(ClusterSearchResult {
-                        heap_pointer,
-                        index_pointer,
-                        distance,
-                    });
-                }
-            }
-
-            if lsr.is_empty() {
-                break;
-            }
+            lsr,
+            meta_page,
+            quantizer_stats,
+            resort_size,
+            resort_buffer: BinaryHeap::with_capacity(resort_size),
+            streaming_stats: StreamingStats::new(resort_size),
+            next_calls: 0,
+            next_calls_with_resort: 0,
+            full_distance_comparisons: 0,
+            has_label_filter,
         }
-
-        all_results
     }
 }
 
@@ -513,14 +212,6 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         storage: &S,
     ) -> Option<(HeapPointer, IndexPointer)> {
         self.next_calls += 1;
-
-        if self.is_cluster_mode {
-            return self
-                .cluster_results
-                .pop()
-                .map(|r| (r.heap_pointer, r.index_pointer));
-        }
-
         let mut graph = Graph::new(GraphNeighborStore::Disk, &mut self.meta_page);
 
         /* Iterate until we find a non-deleted tuple */
@@ -557,11 +248,6 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         storage: &S,
     ) -> Option<(HeapPointer, IndexPointer)> {
         self.next_calls_with_resort += 1;
-
-        if self.is_cluster_mode {
-            return self.next(storage);
-        }
-
         if self.resort_buffer.capacity() == 0 {
             return self.next(storage);
         }
