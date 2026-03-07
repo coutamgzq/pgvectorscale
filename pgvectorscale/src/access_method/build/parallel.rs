@@ -451,6 +451,7 @@ impl ClusterQueues {
 
     /// Pop multiple vectors from the queue for a specific cluster in batch
     /// Returns the number of vectors popped, stored in the provided buffer
+    /// Uses CAS (Compare-And-Swap) operation to ensure thread-safety in multi-worker scenarios
     pub unsafe fn pop_batch_from_queue(
         &self,
         base_ptr: *mut u8,
@@ -464,37 +465,55 @@ impl ClusterQueues {
         let mut popped = 0;
 
         while popped < max_count {
+            // Load head and tail with Acquire ordering to ensure we see the latest values
             let head = (*header).head.load(std::sync::atomic::Ordering::Acquire);
             let tail = (*header).tail.load(std::sync::atomic::Ordering::Acquire);
 
             if head == tail {
+                // Queue is empty
                 break;
             }
 
-            let entry_ptr = self.get_entry(base_ptr, cluster_id, head);
-            let heap_tid = (*entry_ptr).heap_tid;
-            let vector_len = (*entry_ptr).vector_len as usize;
-
             let next_head = (head + 1) % (*header).capacity;
-            (*header)
-                .head
-                .store(next_head, std::sync::atomic::Ordering::Release);
 
-            if heap_tid.ip_posid == 0
-                || heap_tid.ip_posid == pg_sys::InvalidOffsetNumber
-                || pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid)
-                    == pg_sys::InvalidBlockNumber
-            {
-                continue;
+            // Use CAS operation to atomically update head
+            // This ensures only one worker can successfully pop this entry
+            match (*header).head.compare_exchange_weak(
+                head,
+                next_head,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // CAS succeeded - we have exclusive access to this entry
+                    let entry_ptr = self.get_entry(base_ptr, cluster_id, head);
+                    let heap_tid = (*entry_ptr).heap_tid;
+                    let vector_len = (*entry_ptr).vector_len as usize;
+
+                    // Skip invalid entries
+                    if heap_tid.ip_posid == 0
+                        || heap_tid.ip_posid == pg_sys::InvalidOffsetNumber
+                        || pgrx::itemptr::item_pointer_get_block_number_no_check(heap_tid)
+                            == pg_sys::InvalidBlockNumber
+                    {
+                        continue;
+                    }
+
+                    let vector_ptr = (entry_ptr as *const u8)
+                        .add(std::mem::size_of::<ClusterQueueEntry>())
+                        as *const f32;
+                    let vector_data = std::slice::from_raw_parts(vector_ptr, vector_len).to_vec();
+
+                    heap_tids[popped] = heap_tid;
+                    vectors[popped] = vector_data;
+                    popped += 1;
+                }
+                Err(_) => {
+                    // CAS failed - another worker already popped this entry
+                    // Continue to try the next entry
+                    continue;
+                }
             }
-
-            let vector_ptr = (entry_ptr as *const u8).add(std::mem::size_of::<ClusterQueueEntry>())
-                as *const f32;
-            let vector_data = std::slice::from_raw_parts(vector_ptr, vector_len).to_vec();
-
-            heap_tids[popped] = heap_tid;
-            vectors[popped] = vector_data;
-            popped += 1;
         }
 
         if popped > 0 {

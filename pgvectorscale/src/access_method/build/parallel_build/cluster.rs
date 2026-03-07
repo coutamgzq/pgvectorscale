@@ -817,6 +817,13 @@ unsafe extern "C-unwind" fn build_callback_collect_vectors(
 
 const BATCH_SIZE: usize = 64;
 
+// Minimum batch size for multi-worker scenarios
+// Ensures each worker gets a reasonable amount of data even when queue has few entries
+const MIN_BATCH_SIZE: usize = 32;
+
+// Maximum batch size to prevent a single worker from consuming too much data
+const MAX_BATCH_SIZE: usize = 256;
+
 /// Statistics for a single cluster
 #[derive(Debug, Clone)]
 struct ClusterStats {
@@ -1233,16 +1240,16 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
     }
 
     // Get assignment after waiting
-    let (cluster_id, start_idx, end_idx, is_primary) = if worker_assignments.is_null() {
+    let cluster_id = if worker_assignments.is_null() {
         let cluster_id = worker_number;
         if cluster_id >= params.num_clusters {
             return;
         }
-        (cluster_id, 0, usize::MAX, true)
+        cluster_id
     } else {
         let assignment = unsafe { (*worker_assignments).get_assignment(worker_number) };
         match assignment {
-            Some(a) => (a.cluster_id, a.start_idx, a.end_idx, a.is_primary),
+            Some(a) => a.cluster_id,
             None => {
                 // Worker has no assignment - exit
                 log!(
@@ -1314,14 +1321,10 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
         let mut consumer_state = ConsumerState {
             cluster_id,
-            start_idx,
-            end_idx,
-            is_primary,
             cluster_queues,
             _parallel_shared: parallel_shared,
             _num_dimensions: params.num_dimensions,
             ntuples: 0,
-            first_node: None,
             worker_number,
             workers_per_cluster,
         };
@@ -1353,14 +1356,10 @@ pub extern "C" fn _vectorscale_build_cluster_consumer_main(
 
 struct ConsumerState {
     cluster_id: usize,
-    start_idx: usize,
-    end_idx: usize,
-    is_primary: bool,
     cluster_queues: *mut ClusterQueues,
     _parallel_shared: *mut ParallelShared,
     _num_dimensions: usize,
     ntuples: usize,
-    first_node: Option<crate::util::ItemPointer>,
     worker_number: usize,
     workers_per_cluster: usize,
 }
@@ -1394,31 +1393,38 @@ unsafe fn process_cluster_vectors<S: Storage>(
         };
 
         log!(
-            "[START] {} (Worker {}) starting to process cluster {}: range [{}..{}], is_primary={}",
+            "[START] {} (Worker {}) starting to process cluster {}: workers_per_cluster={}",
             worker_name,
             consumer_state.worker_number,
             cluster_id,
-            consumer_state.start_idx,
-            consumer_state.end_idx,
-            consumer_state.is_primary
+            consumer_state.workers_per_cluster
         );
     }
 
     let mut insert_stats = InsertStats::default();
-    let mut queue_idx: usize = 0;
-    let start_idx = consumer_state.start_idx;
-    let end_idx = consumer_state.end_idx;
     let num_dimensions = meta_page.get_num_dimensions_to_index() as usize;
     let mut start_node_set = false; // 标记是否已处理 start node
+    let workers_per_cluster = consumer_state.workers_per_cluster;
 
-    let mut batch_heap_tids: Vec<pg_sys::ItemPointerData> = vec![std::mem::zeroed(); BATCH_SIZE];
-    let mut batch_vectors: Vec<Vec<f32>> = (0..BATCH_SIZE)
+    let mut batch_heap_tids: Vec<pg_sys::ItemPointerData> = vec![std::mem::zeroed(); MAX_BATCH_SIZE];
+    let mut batch_vectors: Vec<Vec<f32>> = (0..MAX_BATCH_SIZE)
         .map(|_| vec![0.0f32; num_dimensions])
         .collect();
 
     loop {
         let available = queues.queue_size(base_ptr, cluster_id);
-        let batch_count = available.min(BATCH_SIZE);
+        
+        // Smart batch size calculation for multi-worker scenarios
+        // Each worker gets approximately 1/workers_per_cluster of available data
+        // This ensures load balancing across all workers in the same cluster
+        let target_batch_size = if available > 0 && workers_per_cluster > 0 {
+            let fair_share = available / workers_per_cluster;
+            fair_share.max(MIN_BATCH_SIZE).min(MAX_BATCH_SIZE)
+        } else {
+            MIN_BATCH_SIZE
+        };
+        
+        let batch_count = available.min(target_batch_size);
 
         if batch_count > 0 {
             check_for_interrupts!();
@@ -1430,15 +1436,8 @@ unsafe fn process_cluster_vectors<S: Storage>(
                 &mut batch_vectors,
             );
 
+            // Process all popped vectors - CAS ensures each entry is processed by only one worker
             for i in 0..popped {
-                if queue_idx < start_idx {
-                    queue_idx += 1;
-                    continue;
-                }
-                if queue_idx >= end_idx {
-                    break;
-                }
-                queue_idx += 1;
 
                 let heap_tid = batch_heap_tids[i];
                 let vector_data = &batch_vectors[i];
@@ -1666,13 +1665,10 @@ unsafe fn build_cluster_subgraph(
     };
 
     log!(
-        "[SUMMARY] {} (Worker {}) finished cluster {}: processed {} vectors, range [{}..{}], is_primary={}",
+        "[SUMMARY] {} (Worker {}) finished cluster {}: processed {} vectors",
         worker_name,
         consumer_state.worker_number,
         cluster_id,
-        consumer_state.ntuples,
-        consumer_state.start_idx,
-        consumer_state.end_idx,
-        consumer_state.is_primary
+        consumer_state.ntuples
     );
 }
