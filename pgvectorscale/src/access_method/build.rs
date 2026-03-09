@@ -10,6 +10,7 @@ use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::GraphNeighborStore;
 use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
+use crate::access_method::guc::TSV_CLUSTER_QUEUE_CAPACITY;
 use crate::access_method::options::{TSVIndexOptions, NUM_CLUSTERS_DEFAULT_SENTINEL};
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
@@ -407,6 +408,7 @@ pub extern "C-unwind" fn ambuild(
                             num_clusters: workers as usize,
                             total_vectors: heap_tuples,
                             num_dimensions: meta_page.get_num_dimensions_to_index() as usize,
+                            queue_capacity: TSV_CLUSTER_QUEUE_CAPACITY.get() as usize,
                         },
                         build_state: ParallelBuildState {
                             producer_done: AtomicBool::new(false),

@@ -8,6 +8,7 @@ use rand::Rng;
 use crate::access_method::distance;
 use crate::access_method::distance::DistanceType;
 use crate::access_method::graph::neighbor_store::{BuilderNeighborCache, GraphNeighborStore};
+use crate::access_method::guc::TSV_CLUSTER_QUEUE_CAPACITY;
 use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::graph::Graph;
 use crate::access_method::guc::TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO;
@@ -27,7 +28,7 @@ use crate::util::ItemPointer;
 
 use super::super::parallel::{
     self, ClusterQueues, ClusterSizes, ClusterStartNodes, WorkerAssignment, WorkerAssignments,
-    DEFAULT_QUEUE_CAPACITY, MAX_WORKERS, SHM_TOC_CENTROIDS_KEY, SHM_TOC_CLUSTER_QUEUES_KEY,
+    MAX_WORKERS, SHM_TOC_CENTROIDS_KEY, SHM_TOC_CLUSTER_QUEUES_KEY,
     SHM_TOC_CLUSTER_SIZES_KEY, SHM_TOC_CLUSTER_START_NODES_KEY, SHM_TOC_WORKER_ASSIGNMENTS_KEY,
 };
 use super::super::{
@@ -207,9 +208,22 @@ pub fn build_index_with_clustering(
         );
     }
 
-    let (centroids, _cluster_assignments) =
+    let (centroids, cluster_assignments) =
         perform_clustering(vectors_for_clustering, num_clusters);
     let actual_num_clusters = centroids.len();
+
+    // Calculate actual cluster sizes from K-Means assignments
+    let mut cluster_sizes = vec![0usize; actual_num_clusters];
+    for &assignment in &cluster_assignments {
+        if assignment < actual_num_clusters {
+            cluster_sizes[assignment] += 1;
+        }
+    }
+
+    notice!("Actual cluster sizes from K-Means:");
+    for (cluster_id, &count) in cluster_sizes.iter().enumerate() {
+        notice!("  Cluster {}: {} vectors", cluster_id, count);
+    }
 
     // Save centroids to meta page
     meta_page.set_centroids(centroids.clone());
@@ -260,6 +274,7 @@ pub fn build_index_with_clustering(
             &centroids,
             write_stats,
             num_dimensions,
+            &cluster_sizes,
         )
     } else {
         do_sequential_cluster_build(
@@ -327,6 +342,7 @@ fn do_parallel_cluster_build(
     centroids: &[Vec<f32>],
     _write_stats: WriteStats,
     num_dimensions: usize,
+    cluster_sizes: &[usize],
 ) -> usize {
     let num_clusters = centroids.len();
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
@@ -345,45 +361,40 @@ fn do_parallel_cluster_build(
 
     let start_time = std::time::Instant::now();
 
-    // Phase 1: Sampling scan to determine cluster sizes
-    // This allows us to properly size queues and assign workers
-    let sample_rate = if heap_tuples > 100000 {
-        0.1 // Sample 10% for large tables
-    } else {
-        1.0 // Full scan for small tables
-    };
+    // Use actual cluster sizes from K-Means clustering (L172-179)
+    // instead of sampling_scan results (L357-364) to ensure consistency
+    let total_vectors: usize = cluster_sizes.iter().sum();
 
-    let sampling_result = unsafe {
-        sampling_scan(
-            heaprel,
-            indexrel,
-            index_info,
-            meta_page,
-            centroids,
-            sample_rate,
-        )
-    };
+    // Create ClusterStats from actual K-Means cluster sizes
+    let cluster_stats: Vec<ClusterStats> = cluster_sizes
+        .iter()
+        .enumerate()
+        .map(|(id, &count)| ClusterStats::with_count(id, count))
+        .collect();
 
-    // Calculate queue capacities based on cluster sizes
-    let queue_capacities = calculate_queue_capacities(
-        &sampling_result.cluster_stats,
-        sampling_result.total_vectors,
+    log!(
+        "Using actual K-Means cluster sizes: total_vectors={}, num_clusters={}",
+        total_vectors, num_clusters
     );
+    for stats in &cluster_stats {
+        log!("  Cluster {}: {} vectors", stats.cluster_id, stats.count);
+    }
+
+    // Calculate queue capacities based on actual cluster sizes from K-Means
+    // Use queue_capacity from GUC (will be passed to workers via shared memory)
+    let queue_capacity = TSV_CLUSTER_QUEUE_CAPACITY.get() as usize;
+    let queue_capacities = calculate_queue_capacities(&cluster_stats, total_vectors, queue_capacity);
+
     // Calculate worker distribution
     let num_workers = workers.min(MAX_WORKERS).max(num_clusters);
     log!(
         "DEBUG: workers={}, MAX_WORKERS={}, num_clusters={}, num_workers={}",
-        workers,
-        MAX_WORKERS,
-        num_clusters,
-        num_workers
+        workers, MAX_WORKERS, num_clusters, num_workers
     );
-    let worker_distribution =
-        calculate_worker_distribution(&sampling_result.cluster_stats, num_workers);
+    let worker_distribution = calculate_worker_distribution(&cluster_stats, num_workers);
     log!(
         "Queue capacities: {:?}, Worker distribution: {:?}",
-        queue_capacities,
-        worker_distribution
+        queue_capacities, worker_distribution
     );
 
     unsafe {
@@ -457,6 +468,7 @@ fn do_parallel_cluster_build(
                 num_clusters,
                 total_vectors: heap_tuples,
                 num_dimensions,
+                queue_capacity: TSV_CLUSTER_QUEUE_CAPACITY.get() as usize,
             },
             build_state: ParallelBuildState {
                 producer_done: AtomicBool::new(false),
@@ -482,7 +494,7 @@ fn do_parallel_cluster_build(
             .iter()
             .copied()
             .max()
-            .unwrap_or(DEFAULT_QUEUE_CAPACITY);
+            .unwrap_or(queue_capacity);
         let queues_template = ClusterQueues::new(num_clusters, max_capacity, num_dimensions);
         std::ptr::write(cluster_queues, queues_template);
         (*cluster_queues).initialize_with_capacities(cluster_queues as *mut u8, &queue_capacities);
@@ -563,36 +575,35 @@ fn do_parallel_cluster_build(
         pg_sys::WaitForParallelWorkersToAttach(pcxt);
 
         // Set worker assignments immediately after workers attach
-        // Use sampling results for assignments (actual sizes will be tracked during scan)
-        log!("Setting worker assignments based on sampling:");
+        // Use actual K-Means cluster sizes for assignments
+        log!("Setting worker assignments based on K-Means cluster sizes:");
         for (cluster_id, workers) in worker_distribution.iter().enumerate() {
             if workers.is_empty() {
                 continue;
             }
 
-            let estimated_cluster_size = sampling_result
-                .cluster_stats
+            let actual_cluster_size = cluster_stats
                 .get(cluster_id)
                 .map(|s| s.count)
                 .unwrap_or(0);
             log!(
-                "  Cluster {}: workers {:?}, estimated size {}",
+                "  Cluster {}: workers {:?}, actual size {}",
                 cluster_id,
                 workers,
-                estimated_cluster_size
+                actual_cluster_size
             );
 
             let workers_for_cluster = workers.len();
-            let chunk_size = if estimated_cluster_size > 0 {
-                (estimated_cluster_size + workers_for_cluster - 1) / workers_for_cluster
+            let chunk_size = if actual_cluster_size > 0 {
+                (actual_cluster_size + workers_for_cluster - 1) / workers_for_cluster
             } else {
                 usize::MAX // If no estimate, let each worker process all
             };
 
             for (i, &worker_id) in workers.iter().enumerate() {
                 let start_idx = i * chunk_size;
-                let end_idx = if estimated_cluster_size > 0 {
-                    ((i + 1) * chunk_size).min(estimated_cluster_size)
+                let end_idx = if actual_cluster_size > 0 {
+                    ((i + 1) * chunk_size).min(actual_cluster_size)
                 } else {
                     usize::MAX
                 };
@@ -689,7 +700,7 @@ fn do_parallel_cluster_build(
         );
         log!(
             "  - Queue capacity: {} entries per cluster",
-            DEFAULT_QUEUE_CAPACITY
+            queue_capacity
         );
         log!("  - Total shared memory: {} bytes", cluster_queues_size);
 
@@ -827,6 +838,7 @@ const MAX_BATCH_SIZE: usize = 256;
 /// Statistics for a single cluster
 #[derive(Debug, Clone)]
 struct ClusterStats {
+    cluster_id: usize,
     count: usize,
     sample_vectors: Vec<Vec<f32>>,
 }
@@ -834,7 +846,16 @@ struct ClusterStats {
 impl ClusterStats {
     fn new() -> Self {
         Self {
+            cluster_id: 0,
             count: 0,
+            sample_vectors: Vec::new(),
+        }
+    }
+
+    fn with_count(cluster_id: usize, count: usize) -> Self {
+        Self {
+            cluster_id,
+            count,
             sample_vectors: Vec::new(),
         }
     }
@@ -952,9 +973,12 @@ unsafe fn sampling_scan(
 }
 
 /// Calculate queue capacity for each cluster based on its size
-fn calculate_queue_capacities(cluster_stats: &[ClusterStats], total_vectors: usize) -> Vec<usize> {
-    let base_capacity = DEFAULT_QUEUE_CAPACITY;
-    let max_capacity = DEFAULT_QUEUE_CAPACITY * 10;
+fn calculate_queue_capacities(
+    cluster_stats: &[ClusterStats],
+    total_vectors: usize,
+    base_capacity: usize,
+) -> Vec<usize> {
+    let max_capacity = base_capacity * 10;
 
     cluster_stats
         .iter()

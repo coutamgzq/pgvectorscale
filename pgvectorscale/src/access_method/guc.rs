@@ -12,6 +12,7 @@ pub static TSV_CLUSTERING_SAMPLE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>:
 pub static TSV_CLUSTER_SEARCH_TOP_K: GucSetting<i32> = GucSetting::<i32>::new(2);
 pub static TSV_CLUSTER_SEARCH_QUEUE_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1000);
 pub static TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static TSV_CLUSTER_QUEUE_CAPACITY: GucSetting<i32> = GucSetting::<i32>::new(10240);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -210,10 +211,29 @@ pub fn init() {
             )
         },
         unsafe {
-            std::ffi::CStr::from_ptr("When enabled, logs detailed information about which worker writes to which page during graph construction. Default is off.".as_pg_cstr())
+            std::ffi::CStr::from_ptr(
+                "When enabled, logs detailed information about which worker writes to which page during graph construction. Default is off.".as_pg_cstr())
         },
         &TSV_DEBUG_GRAPH_FLUSH_PAGE_INFO,
         GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("diskann.cluster_queue_capacity".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Default capacity for cluster queues during parallel index build".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Determines the base capacity for each cluster queue. Higher values allow more vectors to be buffered but consume more memory. Default is 10240.".as_pg_cstr())
+        },
+        &TSV_CLUSTER_QUEUE_CAPACITY,
+        1024,
+        100000,
+        GucContext::Suset,
         GucFlags::default(),
     );
 }

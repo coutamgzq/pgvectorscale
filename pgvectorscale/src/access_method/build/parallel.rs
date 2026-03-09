@@ -46,6 +46,7 @@ pub struct ParallelSharedParams {
     pub num_clusters: usize,
     pub total_vectors: usize,
     pub num_dimensions: usize,
+    pub queue_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -668,9 +669,6 @@ impl ClusterStartNodes {
         }
     }
 }
-
-/// Default capacity for each queue
-pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 /// Maximum number of workers supported
 pub const MAX_WORKERS: usize = 64;
