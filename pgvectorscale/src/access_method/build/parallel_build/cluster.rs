@@ -636,6 +636,9 @@ fn do_parallel_cluster_build(
         );
         log!("Assignments ready, starting heap scan...");
 
+        let total_vectors = (*parallel_shared).params.total_vectors;
+        log!("Producer: total_vectors to scan: {}", total_vectors);
+
         let mut producer_state = ProducerState {
             _parallel_shared: parallel_shared,
             cluster_queues,
@@ -644,6 +647,8 @@ fn do_parallel_cluster_build(
             ntuples: 0,
             meta_page: meta_page.clone(),
             batch_buffer: BatchBuffer::new(),
+            total_vectors,
+            last_progress_print: 0,
         };
 
         pg_sys::IndexBuildHeapScan(
@@ -1124,6 +1129,8 @@ struct ProducerState<'a> {
     ntuples: usize,
     meta_page: MetaPage,
     batch_buffer: BatchBuffer,
+    total_vectors: usize,
+    last_progress_print: usize,
 }
 
 impl ProducerState<'_> {
@@ -1193,6 +1200,21 @@ unsafe extern "C-unwind" fn producer_callback(
         let cluster_id = k_means::k_means_lookup(vector_slice, producer_state.centroids);
 
         producer_state.push_with_batch(cluster_id, *ctid, vector_slice);
+
+        // Print progress every 100k rows
+        const PROGRESS_INTERVAL: usize = 100_000;
+        if producer_state.ntuples > 0
+            && producer_state.ntuples % PROGRESS_INTERVAL == 0
+            && producer_state.ntuples != producer_state.last_progress_print
+        {
+            log!(
+                "Producer progress: scanned {} / {} vectors ({:.1}%)",
+                producer_state.ntuples,
+                producer_state.total_vectors,
+                (producer_state.ntuples as f64 / producer_state.total_vectors.max(1) as f64) * 100.0
+            );
+            producer_state.last_progress_print = producer_state.ntuples;
+        }
     }
 }
 
